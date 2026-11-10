@@ -12,9 +12,26 @@ the exact evidence and remaining workload checks.
 
 ## Point an agent at the tool
 
-Tell it: **"Run `rmgr manual`, then read `rmgr manual ownership` and
-`rmgr manual limits`. Submit experiments through this manager and cancel only
-jobs for which you have explicit authority."**
+Give the agent these instructions:
+
+> Run `rmgr manual`, then read `rmgr manual ownership` and `rmgr manual limits`.
+> Submit experiments with `rmgr submit --receipt /private/path/run.receipt.json
+> [resource options] -- PROGRAM [arguments]`. Use a new receipt path for each
+> new job and keep it private and out of version control. The receipt contains
+> that job's secret control key; preserve it across conversation restarts.
+> To retry a submission after a lost response, use `rmgr retry --receipt PATH`.
+> To cancel your job, use `rmgr cancel JOB_ID --receipt PATH`.
+> Read-only queries are shared, but a job ID alone does not authorize control.
+> Do not search for or reuse another agent's receipts, or bypass the API with
+> direct process/service control. Cancel only jobs you submitted or for which
+> the user explicitly delegated authority and supplied the matching receipt.
+
+The per-job `control_token` is generated automatically and required by the API
+for cancellation and submission retries. There is no API to edit a submitted
+job's command or resources. The `--exclusive` flag controls scheduling (running
+alone among managed jobs); it does not grant ownership or replace the key.
+Receipts protect against accidental API interference, not unrestricted access
+by other processes running under the same Linux account.
 
 The bundled manual works offline, includes examples and failure handling, and
 supports topics or `rmgr manual all --json`. Command-specific `--help` supplies
