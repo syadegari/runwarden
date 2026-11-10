@@ -119,6 +119,25 @@ class InterfaceTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "memory limit"):
             verify_limits(self.home, [2, 3, 8], GIB)
 
+    def test_runner_explains_missing_controllers_and_swap_support(self):
+        limits = {"cpuset.cpus.effective": "0", "memory.max": str(GIB), "memory.swap.max": "0"}
+        for missing, expected in (("cpuset.cpus.effective", "cpuset controller"),
+                                  ("memory.max", "memory controller"),
+                                  ("memory.swap.max", "swap accounting support")):
+            with self.subTest(missing=missing):
+                for filename, value in limits.items():
+                    (self.home / filename).write_text(value)
+                (self.home / missing).unlink()
+                with self.assertRaisesRegex(RuntimeError, expected) as error:
+                    verify_limits(self.home, [0], GIB)
+                if missing != "memory.swap.max":
+                    self.assertIn(f"user@{os.getuid()}.service", str(error.exception))
+                    self.assertIn("Delegate=cpu cpuset memory pids", str(error.exception))
+
+    def test_runner_distinguishes_missing_cgroup_from_missing_controller(self):
+        with self.assertRaisesRegex(RuntimeError, "Job cgroup disappeared"):
+            verify_limits(self.home / "gone", [0], GIB)
+
     def test_environment_does_not_inherit_agent_secrets_or_override_gpu_policy(self):
         spec = {"cores": 2, "gpu": False, "env": {"OMP_NUM_THREADS": "1", "CUDA_VISIBLE_DEVICES": "0"}}
         with patch.dict(os.environ, {"SECRET_FOR_TEST": "sensitive"}):

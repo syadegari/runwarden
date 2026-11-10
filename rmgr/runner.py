@@ -27,14 +27,39 @@ def current_cgroup() -> Path:
     raise RuntimeError("A unified cgroup v2 hierarchy is required")
 
 
+def read_limit(cgroup: Path, filename: str) -> str:
+    try:
+        return (cgroup / filename).read_text().strip()
+    except FileNotFoundError as exc:
+        if not cgroup.is_dir():
+            raise RuntimeError(f"Job cgroup disappeared before limits could be verified: {cgroup}") from exc
+        if filename == "memory.swap.max":
+            message = (
+                "Swap enforcement is unavailable: memory.swap.max is missing from the job cgroup. "
+                "Check kernel cgroup v2 swap accounting support."
+            )
+        else:
+            controller = filename.split(".", 1)[0]
+            unit = f"user@{os.getuid()}.service"
+            message = (
+                f"The {controller} controller is unavailable in the job cgroup ({filename} is missing). "
+                f"Check delegation with: systemctl show {unit} -p Delegate -p DelegateControllers. "
+                f"An administrator may need to run: sudo systemctl edit {unit}, "
+                "and add [Service] with Delegate=cpu cpuset memory pids. "
+                "Apply at a planned reboot or full user-manager restart, then rerun rmgr doctor. "
+                "See rmgr manual for host setup."
+            )
+        raise RuntimeError(message) from exc
+
+
 def verify_limits(cgroup: Path, cpus: list[int], memory: int) -> None:
-    effective = parse_cpus((cgroup / "cpuset.cpus.effective").read_text())
+    effective = parse_cpus(read_limit(cgroup, "cpuset.cpus.effective"))
     if effective != set(cpus):
         raise RuntimeError(f"CPU allocation mismatch: expected {cpus}, got {sorted(effective)}")
-    limit = (cgroup / "memory.max").read_text().strip()
+    limit = read_limit(cgroup, "memory.max")
     if limit == "max" or int(limit) > memory:
         raise RuntimeError("Requested memory limit is not enforced")
-    if (cgroup / "memory.swap.max").read_text().strip() != "0":
+    if read_limit(cgroup, "memory.swap.max") != "0":
         raise RuntimeError("Job swap must be disabled")
 
 

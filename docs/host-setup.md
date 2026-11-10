@@ -19,6 +19,12 @@ administrator can inspect your account's user-manager unit:
 systemctl show "user@$(id -u).service" -p Delegate -p DelegateControllers
 ```
 
+For example, Ubuntu 24.04 may show `DelegateControllers=cpu memory pids`.
+The missing `cpuset` controller prevents core assignments from being enforced,
+even though `cpu` is present: these are separate controllers. The enforcement
+probe then fails because `cpuset.cpus.effective` does not exist in its cgroup.
+This is a host delegation setting, not a failed Python installation.
+
 If required, create a drop-in for that specific account, using
 `sudo systemctl edit "user@$(id -u).service"`:
 
@@ -27,10 +33,15 @@ If required, create a drop-in for that specific account, using
 Delegate=cpu cpuset memory pids
 ```
 
-Apply it at a planned logout/login or reboot. Restarting an active user manager
-can terminate that user's services, so do not do that in the middle of work.
+Apply it at a planned reboot, or a full logout/login that stops and restarts
+the user manager. With lingering enabled or other sessions still open, logging
+out alone may leave the old manager running. Restarting an active user manager
+can terminate that user's services and desktop, so do not do that in the middle of work.
 Rerun `rmgr doctor` afterward; the actual execution probe is the deciding check.
 See [systemd resource controls](https://freedesktop.org/software/systemd/man/latest/systemd.resource-control.html).
+
+If `memory.swap.max` alone is missing, check the kernel's cgroup v2 swap
+accounting support; changing CPU delegation will not restore that interface.
 
 For startup at boot and persistence after logout:
 
