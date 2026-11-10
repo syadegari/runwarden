@@ -38,6 +38,16 @@ zero from `submit` as evidence that the experiment has finished.
 
 ## jobs
 
+The normal interface is a command prefix:
+
+    rmgr submit MANAGER_OPTIONS -- PROGRAM PROGRAM_ARGUMENTS
+
+No wrapper script or JSON file is required. Everything after `--` is passed as
+the target program's arguments, including its own flags. The manager queues
+and launches that program when resources become available. `program | rmgr`
+is not supported: the shell would start the program before admission and pipe
+its output instead of submitting its command.
+
 Choose a private receipt path unique to this submission and an experiment
 directory that other jobs will not modify:
 
