@@ -84,6 +84,18 @@ budget, not a live free-memory guarantee. Lower it when sharing the desktop.
 Set `gpu_count` to 1 only when GPU 0 is ready. GPU ownership is a cooperative
 reservation; there is no device-access security or GPU memory partitioning.
 
+Both `health` and a successful `doctor` report these GPU fields under `enforcement`:
+
+- `gpu_device_isolation: false`: GPU device access is not enforced; this does
+  not mean the GPU is inaccessible. This replaces the misleading
+  `gpu_device_access` field in older versions.
+- `gpu_reservation`: whether GPU scheduling is enabled (`gpu_count=1`).
+- `gpu_availability: "not_checked"`: neither check tests GPU hardware or drivers.
+- `gpu_note`: explains these limitations and whether reservations are enabled.
+
+When upgrading, reinstall the package and restart the daemon to update `health`.
+Older cached enforcement evidence is translated to the new fields on startup.
+
 ## Submit and query
 
 ```bash

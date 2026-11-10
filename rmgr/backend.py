@@ -29,6 +29,27 @@ def unit_name(job_id: str) -> str:
     return f"rmgr-job-{job_id}.service"
 
 
+def gpu_capabilities(config: Config) -> dict:
+    reservation = config.gpu_count == 1
+    scheduling = (
+        "GPU reservations are enabled: one managed GPU job at a time. "
+        if reservation else
+        "GPU reservations are disabled (gpu_count=0); set gpu_count=1 once GPU 0 is ready. "
+    )
+    return {
+        "gpu_device_isolation": False,
+        "gpu_reservation": reservation,
+        "gpu_availability": "not_checked",
+        "gpu_note": (
+            scheduling
+            + "GPU hardware and driver availability have not been tested. "
+            "gpu_device_isolation=false means device access is not enforced, not that the GPU is inaccessible. "
+            "Reservations and CUDA_VISIBLE_DEVICES rely on cooperating programs; "
+            "programs outside Runwarden can still access the GPU."
+        ),
+    }
+
+
 class SystemdBackend:
     def __init__(self, home: Path):
         self.home = home
@@ -135,7 +156,7 @@ class SystemdBackend:
                     if observation.state != "succeeded":
                         raise RmgrError("ENFORCEMENT_UNAVAILABLE", observation.reason)
                     return {"cpu_cpuset": True, "memory_limit": True, "swap_disabled": True,
-                            "gpu_device_access": False, "gpu_reservation": config.gpu_count == 1}
+                            **gpu_capabilities(config)}
                 time.sleep(0.05)
             raise RmgrError("BACKEND_UNAVAILABLE", "Enforcement probe timed out")
         finally:
