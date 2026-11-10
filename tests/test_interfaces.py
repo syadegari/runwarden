@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from rmgr.backend import SystemdBackend
+from rmgr.backend import Observation, SystemdBackend
 from rmgr.cli import main, memory_size, parser, submission
 from rmgr.daemon import API
 from rmgr.models import Config, GIB, RmgrError, prepare_home
@@ -67,6 +67,40 @@ class InterfaceTests(unittest.TestCase):
         health = self.api.dispatch({"op": "health"})
         self.assertEqual(health["status"], "degraded")
         self.assertEqual(health["error"]["code"], "BACKEND_UNAVAILABLE")
+
+    def test_health_updates_legacy_gpu_evidence_without_claiming_hardware_access(self):
+        cached = {"cpu_cpuset": True, "gpu_device_access": False, "gpu_reservation": False}
+        for gpu_count in (0, 1):
+            with self.subTest(gpu_count=gpu_count):
+                self.scheduler.config = Config([0, 1], 4 * GIB, gpu_count)
+                api = API(self.scheduler, self.home, cached)
+                report = api.dispatch({"op": "health"})["enforcement"]
+                self.assertNotIn("gpu_device_access", report)
+                self.assertFalse(report["gpu_device_isolation"])
+                self.assertEqual(report["gpu_reservation"], bool(gpu_count))
+                self.assertEqual(report["gpu_availability"], "not_checked")
+                self.assertIn("not that the GPU is inaccessible", report["gpu_note"])
+                self.assertTrue(report["cpu_cpuset"])
+        self.assertIn("gpu_device_access", cached)
+
+    def test_doctor_explains_gpu_limits_after_successful_cpu_memory_probe(self):
+        for gpu_count in (0, 1):
+            with self.subTest(gpu_count=gpu_count):
+                config = {"cpu_ids": [0], "memory_bytes": GIB, "gpu_count": gpu_count}
+                (self.home / "config.json").write_text(json.dumps(config))
+                with patch.object(SystemdBackend, "launch"), \
+                     patch.object(SystemdBackend, "observe", return_value=Observation("succeeded")), \
+                     patch.object(SystemdBackend, "cancel"), \
+                     patch.object(SystemdBackend, "forget"), redirect_stdout(StringIO()) as output:
+                    code = main(["--home", str(self.home), "doctor", "--json"])
+                self.assertEqual(code, 0)
+                report = json.loads(output.getvalue())["enforcement"]
+                self.assertNotIn("gpu_device_access", report)
+                self.assertFalse(report["gpu_device_isolation"])
+                self.assertEqual(report["gpu_reservation"], bool(gpu_count))
+                self.assertEqual(report["gpu_availability"], "not_checked")
+                expected = "one managed GPU job" if gpu_count else "set gpu_count=1"
+                self.assertIn(expected, report["gpu_note"])
 
     def test_list_pagination(self):
         self.submit()

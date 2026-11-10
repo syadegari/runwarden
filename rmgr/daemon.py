@@ -11,7 +11,7 @@ import socket
 import struct
 
 from . import __version__
-from .backend import SystemdBackend
+from .backend import SystemdBackend, gpu_capabilities
 from .models import ACTIVE, Config, RmgrError, integer, prepare_home, require
 from .scheduler import Scheduler
 from .store import Store
@@ -25,7 +25,10 @@ class API:
     def __init__(self, scheduler: Scheduler, home: Path, capabilities: dict):
         self.scheduler = scheduler
         self.home = home
-        self.capabilities = capabilities
+        # Older cached evidence may be reused when jobs survive a daemon upgrade.
+        self.capabilities = dict(capabilities)
+        self.capabilities.pop("gpu_device_access", None)
+        self.capabilities.update(gpu_capabilities(scheduler.config))
 
     def dispatch(self, request: dict) -> dict:
         require(isinstance(request, dict), "Request must be an object")

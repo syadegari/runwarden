@@ -224,6 +224,19 @@ degraded. `resources` reports CPU/RAM/GPU reservations. `doctor` additionally
 starts a short enforcement probe, so it refuses while the daemon or managed
 jobs are running. A socket file's existence does not establish daemon readiness.
 
+GPU fields under enforcement in health and a successful doctor:
+
+- gpu_device_isolation=false means GPU device access is not enforced; it does
+  not mean the GPU is inaccessible. This replaces the old gpu_device_access name.
+- gpu_reservation reflects whether gpu_count=1 enables one managed GPU job at
+  a time. With gpu_count=0 it is false; set the count to 1 once GPU 0 is ready.
+- gpu_availability="not_checked" means hardware and drivers have not been tested.
+- gpu_note explains the current configuration and cooperative access limits.
+
+CUDA_VISIBLE_DEVICES controls visibility for cooperating programs. Programs
+outside Runwarden can still access the GPU. After upgrading the installed
+package, restart the daemon to update its health output.
+
 Common errors:
 
 - DAEMON_UNAVAILABLE: check the chosen --home and service status. A sandbox can
