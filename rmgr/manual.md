@@ -250,3 +250,24 @@ and user lingering are separate, explicit host setup steps. rmgr never uses
 sudo automatically. Stop the scheduler before package upgrades and preserve
 its state and private receipts. Live validation instructions are in the project
 README/docs; runtime capabilities must be checked on the actual host.
+
+Host setup for a missing cpuset or memory controller:
+
+    systemctl show "user@$(id -u).service" -p Delegate -p DelegateControllers
+
+The cpu and cpuset controllers are separate. A user manager with only
+`cpu memory pids` delegated cannot enforce CPU core assignments; its jobs lack
+`cpuset.cpus.effective`. An administrator can add an account-specific override:
+
+    sudo systemctl edit "user@$(id -u).service"
+
+Enter these two lines in the override:
+
+    [Service]
+    Delegate=cpu cpuset memory pids
+
+Apply at a planned reboot or full logout/login that restarts the user manager,
+then rerun `rmgr doctor`. Lingering or other open sessions may keep the manager
+alive after logout. Restarting it during work can terminate the desktop and
+user services. A missing `memory.swap.max` instead requires checking kernel
+cgroup v2 swap accounting support. The tool never applies these changes itself.
