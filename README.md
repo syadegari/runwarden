@@ -5,9 +5,10 @@ It reserves physical cores, RAM, and an optional single GPU. Exclusive jobs
 run alone among managed jobs. Systemd owns each job's process tree and enforces
 CPU sets, RAM limits, execution timeouts, and cancellation.
 
-This is an initial implementation. Scheduler and interface tests pass; live
-systemd/cgroup validation is still required on the host before relying on it
-for experiments. See [validation](docs/validation.md) for the exact evidence.
+This is an initial implementation. Scheduler, interface, and live systemd/cgroup
+tests passed on the development host. Validate enforcement on each target host
+before relying on it for experiments. See [validation](docs/validation.md) for
+the exact evidence and remaining workload checks.
 
 ## Point an agent at the tool
 
@@ -97,6 +98,27 @@ When upgrading, reinstall the package and restart the daemon to update `health`.
 Older cached enforcement evidence is translated to the new fields on startup.
 
 ## Submit and query
+
+Submit the target program directly; no wrapper script or JSON specification is
+required:
+
+```bash
+rmgr submit --receipt ./run-01.receipt.json --cores 16 --memory 8G \
+  --timeout 600 -- python -m fe_solver solve /absolute/path/to/run.toml \
+  --solver-backend superlu_mt --num-threads 16
+```
+
+Run from the FE checkout (or set `--cwd /path/to/fe_solver`) with the intended
+Python environment active and the solver's native library configured as usual.
+`rmgr` resolves `python` on the submitting client's PATH. Each FE run should
+have its own deck/output directory.
+
+Everything before `--` configures the manager; everything after it is the
+program and its arguments. `--cores` reserves capacity; the program's own flags
+control its workers. Submission queues the command and returns a job ID; use
+`wait` for completion and `logs` for output. A pipe such as `program | rmgr`
+would start the program immediately and pipe its output, bypassing admission
+and launch-time resource enforcement. It is not a submission interface.
 
 ```bash
 rmgr submit --receipt ./experiment-01.receipt.json --request-id experiment-01 --cores 8 --memory 16G \
@@ -208,6 +230,9 @@ finishes. History stores the submitted command and environment, not automatic
 source revision discovery.
 
 ## Development and boundaries
+
+See [demo jobs](docs/demo-jobs.md) for two CUDA simulations, two 16-thread native
+FE benchmarks, submission commands, monitoring, and persistent logs.
 
 ```bash
 python3 -m unittest discover -s tests -v
