@@ -79,6 +79,7 @@ def main():
             command.extend(["--json", str(run / "blocking-results.json")])
         receipt = run / f"{name}.receipt.json"
         submit = [*cli, "submit", "--id-only", "--receipt", str(receipt), "--cwd", str(run),
+                  "--stdout", f"{name}.stdout.log", "--stderr", f"{name}.stderr.log",
                   "--cores", str(cores), "--memory", memory,
                   "--timeout", str(180 if args.kind == "fe" else args.seconds + 30)]
         if args.kind == "gpu":
@@ -88,7 +89,9 @@ def main():
                        "--env", "MKL_NUM_THREADS=1", "--env", "OMP_NUM_THREADS=1",
                        "--env", "NUMEXPR_NUM_THREADS=1"]
         job_id = subprocess.check_output([*submit, "--", *command], text=True).strip()
-        jobs.append({"name": name, "id": job_id, "receipt": str(receipt), "argv": command})
+        jobs.append({"name": name, "id": job_id, "receipt": str(receipt), "argv": command,
+                     "stdout_path": str(run / f"{name}.stdout.log"),
+                     "stderr_path": str(run / f"{name}.stderr.log")})
         (run / "jobs.json").write_text(json.dumps(jobs, indent=2) + "\n")
         print(f"{name}: {job_id}", flush=True)
     print(f"Saved IDs and receipt paths: {run / 'jobs.json'}", flush=True)

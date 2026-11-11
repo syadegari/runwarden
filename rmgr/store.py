@@ -1,6 +1,7 @@
 """SQLite persistence; the daemon is the sole writer."""
 
 import json
+import os
 from pathlib import Path
 import sqlite3
 import time
@@ -12,6 +13,7 @@ from .control import authorize, token_digest
 
 class Store:
     def __init__(self, home: Path):
+        self.home = home.absolute()
         self.db = sqlite3.connect(home / "jobs.sqlite3")
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -28,22 +30,46 @@ class Store:
                 allocation TEXT,
                 reason TEXT,
                 exit_code INTEGER,
-                control_token_hash TEXT
+                control_token_hash TEXT,
+                stdout_path TEXT,
+                stderr_path TEXT
             )
         """)
         columns = {row["name"] for row in self.db.execute("PRAGMA table_info(jobs)")}
         if "control_token_hash" not in columns:
             # Existing history stays intact. Never invent control credentials for old jobs.
             self.db.execute("ALTER TABLE jobs ADD COLUMN control_token_hash TEXT")
+        for stream in ("stdout", "stderr"):
+            if f"{stream}_path" not in columns:
+                # NULL means the legacy central location; never move old outputs.
+                self.db.execute(f"ALTER TABLE jobs ADD COLUMN {stream}_path TEXT")
         self.db.commit()
 
-    @staticmethod
-    def decode(row) -> dict:
+    def decode(self, row) -> dict:
         job = dict(row)
         job.pop("control_token_hash", None)
         job["spec"] = json.loads(job["spec"])
         job["allocation"] = json.loads(job["allocation"]) if job["allocation"] else None
+        for stream in ("stdout", "stderr"):
+            if job[f"{stream}_path"] is None:
+                job[f"{stream}_path"] = str(self.home / "jobs" / job["id"] / f"{stream}.log")
         return job
+
+    def retry(self, request_id: str, specification: dict, control_token: object) -> dict | None:
+        require(isinstance(request_id, str), "request_id must be a string")
+        existing = self.db.execute("SELECT * FROM jobs WHERE request_id = ?", (request_id,)).fetchone()
+        if existing is None:
+            return None
+        authorize(existing["control_token_hash"], control_token)
+        # Compare against the accepted request without revalidating its old cwd
+        # or resource requirements against a potentially changed configuration.
+        try:
+            payload = json.dumps(JobSpec(**specification).to_dict(), sort_keys=True)
+        except (TypeError, ValueError) as exc:
+            raise RmgrError("REQUEST_CONFLICT", "request_id already exists with a different specification") from exc
+        if existing["spec"] != payload:
+            raise RmgrError("REQUEST_CONFLICT", "request_id already exists with a different specification")
+        return self.decode(existing)
 
     def get(self, job_id: str) -> dict:
         require(isinstance(job_id, str), "job_id must be a string")
@@ -58,20 +84,20 @@ class Store:
     def submit(self, request_id: str, spec: JobSpec, control_token: str) -> dict:
         digest = token_digest(control_token)
         payload = json.dumps(spec.to_dict(), sort_keys=True)
-        existing = self.db.execute("SELECT * FROM jobs WHERE request_id = ?", (request_id,)).fetchone()
+        existing = self.retry(request_id, spec.to_dict(), control_token)
         if existing is not None:
-            authorize(existing["control_token_hash"], control_token)
-            if existing["spec"] != payload:
-                raise RmgrError("REQUEST_CONFLICT", "request_id already exists with a different specification")
-            return self.decode(existing)
+            return existing
         # Dependencies must already exist. New jobs can only point backwards, so cycles are impossible.
         for dependency in spec.after_success:
             self.get(dependency)
         job_id = uuid.uuid4().hex
+        paths = [os.path.abspath(Path(spec.cwd) / (getattr(spec, stream) or f"rmgr-{job_id}.{stream}.log"))
+                 for stream in ("stdout", "stderr")]
         with self.db:
             self.db.execute(
-                "INSERT INTO jobs (id, request_id, spec, state, created, control_token_hash) VALUES (?, ?, ?, 'queued', ?, ?)",
-                (job_id, request_id, payload, time.time(), digest),
+                "INSERT INTO jobs (id, request_id, spec, state, created, control_token_hash, stdout_path, stderr_path) "
+                "VALUES (?, ?, ?, 'queued', ?, ?, ?, ?)",
+                (job_id, request_id, payload, time.time(), digest, *paths),
             )
         return self.get(job_id)
 
@@ -80,6 +106,10 @@ class Store:
         row = self.db.execute("SELECT control_token_hash FROM jobs WHERE id = ?", (job_id,)).fetchone()
         authorize(row["control_token_hash"], control_token)
         return job
+
+    def uses_legacy_outputs(self, job_id: str) -> bool:
+        row = self.db.execute("SELECT stdout_path FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        return row["stdout_path"] is None
 
     def update(self, job_id: str, **fields) -> None:
         allowed = {"state", "started", "finished", "allocation", "reason", "exit_code"}

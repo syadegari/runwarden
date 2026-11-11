@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path
 import sys
+import stat
+from contextlib import ExitStack
 
 
 def parse_cpus(value: str) -> set[int]:
@@ -77,22 +79,48 @@ def environment(spec: dict) -> dict[str, str]:
 
 
 def run(manifest_path: Path) -> int:
-    manifest = json.loads(manifest_path.read_text())
     directory = manifest_path.parent
-    for stream, fd in (("stdout", 1), ("stderr", 2)):
-        with (directory / f"{stream}.log").open("ab", buffering=0) as output:
-            os.dup2(output.fileno(), fd)
+    # Keep launcher diagnostics in the journal/central record, separate from
+    # the target program's stderr even if exec fails after redirection.
+    diagnostic_fd = os.dup(2)
     try:
+        manifest = json.loads(manifest_path.read_text())
         spec = manifest["spec"]
         verify_limits(current_cgroup(), manifest["cpu_ids"], spec["memory_bytes"])
         os.sched_setaffinity(0, manifest["cpu_ids"])
         os.chdir(spec["cwd"])
         env = environment(spec)
-        os.execve(spec["argv"][0], spec["argv"], env)
+        outputs = manifest.get("output_paths")
+        with ExitStack() as stack:
+            opened = []
+            identities = {}
+            for stream, fd in (("stdout", 1), ("stderr", 2)):
+                path = outputs[stream] if outputs is not None else directory / f"{stream}.log"
+                flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+                flags |= os.O_EXCL if outputs is not None else os.O_APPEND
+                output_fd = os.open(path, flags, 0o600)
+                stack.callback(os.close, output_fd)
+                if not stat.S_ISREG(os.fstat(output_fd).st_mode):
+                    raise RuntimeError(f"{stream} must be a regular file: {path}")
+                info = os.fstat(output_fd)
+                identities[stream] = {"device": info.st_dev, "inode": info.st_ino}
+                opened.append((output_fd, fd))
+            if outputs is not None:
+                # Readers must not mistake a colliding/replaced file for this
+                # job's output. Publish only after both files are created.
+                pending = directory / "output-files.json.tmp"
+                pending.write_text(json.dumps(identities))
+                pending.replace(directory / "output-files.json")
+            # Open both destinations before redirecting either stream.
+            for output_fd, fd in opened:
+                os.dup2(output_fd, fd)
+            os.execve(spec["argv"][0], spec["argv"], env)
     except Exception as exc:
         (directory / "launch-error.txt").write_text(str(exc))
-        print(f"rmgr: refusing to launch job: {exc}", file=sys.stderr, flush=True)
+        os.write(diagnostic_fd, f"rmgr: refusing to launch job: {exc}\n".encode(errors="replace"))
         return 125
+    finally:
+        os.close(diagnostic_fd)
 
 
 if __name__ == "__main__":

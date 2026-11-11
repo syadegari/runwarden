@@ -7,6 +7,7 @@ from .models import RmgrError
 
 
 COMMAND_HELP = {
+    "instructions": "Print agent onboarding instructions to stdout; no daemon required",
     "manual": "Read the offline usage guide; start with 'rmgr manual'",
     "init": "Create configuration without replacing existing settings",
     "daemon": "Run the scheduler in the foreground (operator command)",

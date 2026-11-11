@@ -7,3 +7,5 @@ dist/
 .rmgr/
 .test-artifacts/
 *.receipt.json
+rmgr-*.stdout.log
+rmgr-*.stderr.log

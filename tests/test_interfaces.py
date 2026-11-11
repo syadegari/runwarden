@@ -8,10 +8,12 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 
 from rmgr.backend import Observation, SystemdBackend
+from rmgr import __version__
 from rmgr.cli import main, memory_size, parser, submission
 from rmgr.daemon import API
 from rmgr.models import Config, GIB, RmgrError, prepare_home
@@ -43,6 +45,9 @@ class InterfaceTests(unittest.TestCase):
 
     def test_logs_have_bounded_byte_cursors(self):
         job = self.submit()
+        # Exercise byte cursors for an existing pre-0.3 central log.
+        with self.store.db:
+            self.store.db.execute("UPDATE jobs SET stdout_path = NULL, stderr_path = NULL WHERE id = ?", (job["id"],))
         directory = self.home / "jobs" / job["id"]
         directory.mkdir()
         (directory / "stdout.log").write_bytes(b"first\nsecond\n")
@@ -67,6 +72,10 @@ class InterfaceTests(unittest.TestCase):
         health = self.api.dispatch({"op": "health"})
         self.assertEqual(health["status"], "degraded")
         self.assertEqual(health["error"]["code"], "BACKEND_UNAVAILABLE")
+        with self.assertRaises(RmgrError) as error:
+            self.submit()
+        self.assertEqual(error.exception.code, "BACKEND_UNAVAILABLE")
+        self.assertEqual(self.store.all(), [])
 
     def test_health_updates_legacy_gpu_evidence_without_claiming_hardware_access(self):
         cached = {"cpu_cpuset": True, "gpu_device_access": False, "gpu_reservation": False}
@@ -186,6 +195,10 @@ class InterfaceTests(unittest.TestCase):
         self.assertIn("$$HOME/%%i/\\\"quote", unit)
         self.assertIn("Restart=on-failure", unit)
         self.assertNotIn("sudo", unit)
+
+    def test_package_metadata_matches_runtime_version(self):
+        project = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        self.assertEqual(tomllib.loads(project.read_text())["project"]["version"], __version__)
 
 
 class BackendTests(unittest.TestCase):

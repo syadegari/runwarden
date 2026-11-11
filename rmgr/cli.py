@@ -42,7 +42,7 @@ def parser() -> argparse.ArgumentParser:
     for name, description in COMMAND_HELP.items():
         parsers[name] = commands.add_parser(name, help=description, description=description)
         parsers[name].add_argument("--json", action="store_true", default=argparse.SUPPRESS)
-    parsers["manual"].add_argument("topic", nargs="?", default="overview", help="overview, jobs, ownership, limits, operations, or all")
+    parsers["manual"].add_argument("topic", nargs="?", default="overview", help="overview, instructions, jobs, ownership, limits, operations, or all")
     parsers["service"].add_argument("action", choices=["render", "install", "status", "start", "stop", "restart"])
     submit = parsers["submit"]
     submit.add_argument("--spec", type=Path, help="JSON job specification")
@@ -50,6 +50,8 @@ def parser() -> argparse.ArgumentParser:
     submit.add_argument("--receipt", type=Path, required=True, help="New private receipt file; saved before submission and never overwritten")
     submit.add_argument("--id-only", action="store_true")
     submit.add_argument("--cwd", type=Path, default=Path.cwd())
+    submit.add_argument("--stdout", help="New stdout file; relative to job cwd (default: rmgr-JOB_ID.stdout.log)")
+    submit.add_argument("--stderr", help="New stderr file; relative to job cwd (default: rmgr-JOB_ID.stderr.log)")
     submit.add_argument("--cores", type=int, default=1)
     submit.add_argument("--memory", type=memory_size, default=1024**3)
     submit.add_argument("--gpu", action="store_true")
@@ -94,14 +96,20 @@ def submission(args) -> dict:
         if not separator:
             raise RmgrError("INVALID_REQUEST", "--env expects KEY=VALUE")
         env[key] = value
-    return {"argv": argv, "cwd": str(args.cwd.resolve()), "cores": args.cores,
+    spec = {"argv": argv, "cwd": str(args.cwd.resolve()), "cores": args.cores,
             "memory_bytes": args.memory, "gpu": args.gpu, "exclusive": args.exclusive,
             "timeout_seconds": args.timeout, "after_success": args.after_success, "env": env}
+    for stream in ("stdout", "stderr"):
+        if getattr(args, stream) is not None:
+            spec[stream] = getattr(args, stream)
+    return spec
 
 
 def execute(args) -> tuple[dict, int]:
     home = args.home.expanduser().resolve()
     name = args.command
+    if name == "instructions":
+        return manual("instructions"), 0
     if name == "manual":
         return manual(args.topic), 0
     if name == "init":
@@ -184,7 +192,7 @@ def main(argv=None) -> int:
         result, code = execute(args)
         if args.command in {"submit", "retry"} and args.id_only:
             print(result["id"])
-        elif args.command == "manual" and not args.json:
+        elif args.command in {"manual", "instructions"} and not args.json:
             print(result["text"])
         elif args.command == "service" and args.action == "render" and not args.json:
             print(result["unit"], end="")

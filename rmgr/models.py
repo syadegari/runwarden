@@ -100,6 +100,8 @@ class JobSpec:
     timeout_seconds: float = 3600
     after_success: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
+    stdout: str | None = None
+    stderr: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict, config: Config):
@@ -135,10 +137,20 @@ class JobSpec:
             require(isinstance(key, str) and re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", key) is not None,
                     "Invalid environment key")
             require(isinstance(value, str) and "\x00" not in value, "Invalid environment value")
-        return cls(argv, cwd, cores, memory, gpu, exclusive, timeout, deps, env)
+        outputs = {}
+        for stream in ("stdout", "stderr"):
+            value = data.get(stream)
+            if value is not None:
+                text(value, stream)
+                outputs[stream] = os.path.abspath(Path(cwd) / value)
+        require(len(set(outputs.values())) == len(outputs), "stdout and stderr must use different paths")
+        return cls(argv, cwd, cores, memory, gpu, exclusive, timeout, deps, env,
+                   data.get("stdout"), data.get("stderr"))
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        # Preserve canonical pre-0.3 specs so existing receipts remain retryable.
+        return {key: value for key, value in asdict(self).items()
+                if key not in {"stdout", "stderr"} or value is not None}
 
 
 def prepare_home(home: Path) -> None:

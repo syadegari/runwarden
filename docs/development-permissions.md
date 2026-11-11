@@ -66,6 +66,9 @@ reviewable host-validation suite yourself, or use a dedicated Unix test account
 whose writable data is disposable. The same applies to a rootful Docker socket,
 which grants much more authority than a normal project directory.
 
-The current session allows project and temporary-directory edits but protects
-`.git`, denies Unix-socket binding/user-systemd access, and blocks direct GitHub
-cloning. It cannot install the user service or alter those restrictions itself.
+The initial restricted development environment allowed project and temporary
+edits but blocked Git metadata writes, Unix sockets, systemd access and direct
+GitHub cloning. These were session permissions, not application limitations.
+Subsequent explicitly approved host commands exercised systemd, sockets and GPU
+execution; see [validation](validation.md). Check the active session's permission
+profile rather than treating this historical environment description as current.

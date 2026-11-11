@@ -179,12 +179,35 @@ class ControlTests(unittest.TestCase):
 
 
 class ManualTests(unittest.TestCase):
+    def test_instructions_print_offline_text_and_json_without_creating_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "absent-state"
+            for flags, structured in ((["instructions"], False),
+                                      (["instructions", "--json"], True),
+                                      (["--json", "instructions"], True)):
+                with self.subTest(flags=flags), patch("rmgr.cli.request") as network, \
+                     patch("rmgr.cli.prepare_home") as prepare, \
+                     redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors:
+                    self.assertEqual(main(["--home", str(home), *flags]), 0)
+                    network.assert_not_called()
+                    prepare.assert_not_called()
+                    self.assertFalse(home.exists())
+                    self.assertEqual(errors.getvalue(), "")
+                    expected = manual("instructions")
+                    if structured:
+                        self.assertEqual(json.loads(output.getvalue()), expected)
+                    else:
+                        self.assertEqual(output.getvalue(), expected["text"] + "\n")
+                    for phrase in ("public job ID", "control_token", "handoff", "rmgr cancel",
+                                   "rmgr retry", "same Linux account"):
+                        self.assertIn(phrase, expected["text"])
+
     def test_manual_is_offline_and_describes_ownership_and_limits(self):
         with patch("rmgr.cli.request") as network, redirect_stdout(StringIO()) as output:
             self.assertEqual(main(["manual", "all", "--json"]), 0)
         network.assert_not_called()
         result = json.loads(output.getvalue())
-        for topic in ("overview", "jobs", "ownership", "limits", "operations"):
+        for topic in ("overview", "instructions", "jobs", "ownership", "limits", "operations"):
             self.assertIn(topic, result["topics"])
         self.assertIn("same Linux account", result["text"])
         self.assertIn("rmgr retry", result["text"])

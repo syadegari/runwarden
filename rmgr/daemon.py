@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import signal
 import socket
+import stat
 import struct
 
 from . import __version__
@@ -50,8 +51,16 @@ class API:
         if operation == "resources":
             return self.scheduler.resources()
         if operation == "submit":
+            # Already-accepted retries do not launch new work or require a
+            # healthy backend; their token and exact specification still match.
+            existing = store.retry(request.get("request_id"), request.get("spec"), request.get("control_token"))
+            if existing is not None:
+                return existing
             if self.scheduler.error:
                 raise RmgrError("BACKEND_UNAVAILABLE", "Scheduler is degraded; retry with the same request_id")
+            # An idle tick may not have touched systemd. Honor the readiness
+            # reported by health even before the next attempted launch.
+            self.scheduler.backend.ping()
             return self.scheduler.submit(request.get("request_id"), request.get("spec"), request.get("control_token"))
         if operation == "inspect":
             return store.get(request.get("job_id"))
@@ -74,17 +83,32 @@ class API:
             offset = integer(request.get("offset", 0), 0, "offset")
             limit = integer(request.get("limit", 16384), 1, "limit")
             require(limit <= 1024 * 1024, "Log limit must be <= 1 MiB")
-            path = self.home / "jobs" / job["id"] / f"{stream}.log"
+            path = Path(job[f"{stream}_path"])
             try:
-                with path.open("rb") as log:
+                identity = None
+                if not store.uses_legacy_outputs(job["id"]):
+                    registration = self.home / "jobs" / job["id"] / "output-files.json"
+                    identity = json.loads(registration.read_text())[stream]
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+                with os.fdopen(fd, "rb") as log:
+                    info = os.fstat(log.fileno())
+                    if not stat.S_ISREG(info.st_mode):
+                        raise RmgrError("LOG_UNAVAILABLE", f"Output is not a regular file: {path}")
+                    if identity is not None and (info.st_dev, info.st_ino) != (identity["device"], identity["inode"]):
+                        raise RmgrError("LOG_UNAVAILABLE", f"Output file was replaced: {path}")
                     log.seek(offset)
                     data = log.read(limit)
                     more = bool(log.read(1))
+                available = True
             except FileNotFoundError:
                 data, more = b"", False
+                available = False
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                raise RmgrError("LOG_UNAVAILABLE", f"Cannot read {path}: {exc}") from exc
             return {"job_id": job["id"], "stream": stream, "offset": offset,
                     "next_offset": offset + len(data), "more": more,
-                    "text": data.decode("utf-8", errors="replace"), "state": job["state"]}
+                    "text": data.decode("utf-8", errors="replace"), "state": job["state"],
+                    "path": str(path), "available": available}
         raise RmgrError("INVALID_REQUEST", "Unknown operation")
 
 

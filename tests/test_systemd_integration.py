@@ -15,6 +15,7 @@ import time
 import unittest
 
 from rmgr.backend import SystemdBackend
+from rmgr.daemon import API
 from rmgr.models import ACTIVE, Config, TERMINAL, physical_cpus, prepare_home
 from rmgr.scheduler import Scheduler
 from rmgr.store import Store
@@ -72,7 +73,7 @@ class SystemdIntegrationTests(unittest.TestCase):
         self.scheduler = Scheduler(self.store, self.config, self.backend)
         completed = self.wait(job)
         self.assertEqual(completed["state"], "succeeded")
-        output = (self.home / "jobs" / job["id"] / "stdout.log").read_text()
+        output = Path(completed["stdout_path"]).read_text()
         self.assertEqual(json.loads(output), completed["allocation"])
 
     def test_memory_and_walltime_enforcement(self):
@@ -80,6 +81,46 @@ class SystemdIntegrationTests(unittest.TestCase):
         self.assertEqual(self.wait(oom)["state"], "oom")
         timeout = self.submit("import time; time.sleep(60)", timeout_seconds=0.5)
         self.assertEqual(self.wait(timeout)["state"], "timed_out")
+
+    def test_custom_outputs_and_launcher_diagnostics_are_separate(self):
+        cwd = self.home / "experiment"
+        cwd.mkdir()
+        job = self.submit("import sys; print('result'); print('warning', file=sys.stderr)",
+                          cwd=str(cwd), stdout="result.out", stderr=str(cwd / "result.err"))
+        completed = self.wait(job)
+        self.assertEqual(completed["state"], "succeeded")
+        self.assertEqual((cwd / "result.out").read_text(), "result\n")
+        self.assertEqual((cwd / "result.err").read_text(), "warning\n")
+        self.assertFalse((self.home / "jobs" / job["id"] / "stdout.log").exists())
+        api = API(self.scheduler, self.home, {})
+        self.assertEqual(api.dispatch({"op": "logs", "job_id": job["id"]})["text"], "result\n")
+
+        failed = self.submit("", cwd=str(cwd), argv=[str(cwd / "missing-executable")])
+        failure = self.wait(failed)
+        self.assertEqual(failure["state"], "failed")
+        self.assertEqual(failure["exit_code"], 125)
+        self.assertIn("missing-executable", failure["reason"])
+        self.assertEqual(Path(failure["stderr_path"]).read_text(), "")
+
+    def test_output_collision_does_not_block_the_scheduler(self):
+        a = self.submit("print('original')", stdout="shared.out")
+        self.assertEqual(self.wait(a)["state"], "succeeded")
+        b = self.submit("print('replacement')", stdout="shared.out")
+        c = self.submit("print('independent')")
+        self.assertEqual(self.wait(b)["state"], "failed")
+        self.assertEqual(self.wait(c)["state"], "succeeded")
+        self.assertEqual((self.home / "shared.out").read_text(), "original\n")
+        api = API(self.scheduler, self.home, {})
+        self.assertFalse(api.dispatch({"op": "logs", "job_id": b["id"]})["available"])
+
+    def test_legacy_queued_job_keeps_central_outputs(self):
+        job = self.submit("print('legacy')")
+        with self.store.db:
+            self.store.db.execute("UPDATE jobs SET stdout_path = NULL, stderr_path = NULL WHERE id = ?", (job["id"],))
+        completed = self.wait(job)
+        self.assertEqual(completed["state"], "succeeded")
+        self.assertEqual(completed["stdout_path"], str(self.home / "jobs" / job["id"] / "stdout.log"))
+        self.assertEqual(Path(completed["stdout_path"]).read_text(), "legacy\n")
 
     def test_cancellation_terminates_descendants(self):
         marker = self.home / "child.pid"
