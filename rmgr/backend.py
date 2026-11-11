@@ -64,7 +64,9 @@ class SystemdBackend:
         directory = self.home / "jobs" / job["id"]
         directory.mkdir(mode=0o700)
         manifest = directory / "launch.json"
-        manifest.write_text(json.dumps({"spec": spec, "cpu_ids": job["allocation"]}))
+        outputs = {stream: job.get(f"{stream}_path", str(directory / f"{stream}.log"))
+                   for stream in ("stdout", "stderr")}
+        manifest.write_text(json.dumps({"spec": spec, "cpu_ids": job["allocation"], "output_paths": outputs}))
         properties = {
             "Type": "exec",
             "ExitType": "cgroup",

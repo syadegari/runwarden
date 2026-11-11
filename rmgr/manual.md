@@ -10,6 +10,7 @@ directory as the other agents. Do not start a second daemon to bypass a queue.
 Start here:
 
     rmgr --version
+    rmgr instructions
     rmgr health --json
     rmgr resources --json
     rmgr submit --help
@@ -17,10 +18,14 @@ Start here:
     rmgr manual ownership
     rmgr manual limits
 
-This manual works offline without a daemon. Topics are overview, jobs,
+This manual works offline without a daemon. Topics are overview, instructions, jobs,
 ownership, limits, and operations. Use `rmgr manual TOPIC` for a short section,
 `rmgr manual all` for the complete guide, or add `--json` for a text envelope
 with version and topic information. No pager or interactive prompts are used.
+`rmgr instructions` prints the instructions topic directly to stdout as readable
+text, ready to pass to an agent. `rmgr instructions --json` provides the same
+content in the manual's version/topic/text envelope. Neither command contacts
+the daemon, reads receipts, or initializes state.
 
 All agents should read ownership and limits before launching experiments.
 `--help` describes exact command syntax; this manual explains workflow and
@@ -31,10 +36,60 @@ Pass a nondefault state directory before the command:
 
     rmgr --home /shared/private/rmgr-state health --json
 
-CLI success output goes to stdout. Operational errors are JSON on stderr;
-argument-parser usage errors are ordinary text. `--json` produces compact JSON
+CLI result output goes to stdout. Data commands use indented JSON by default;
+there is no plain-text table mode for list. CLI/API exceptions are JSON on stderr;
+doctor and health print their diagnostic reports to stdout even when they exit 2.
+Argument-parser usage errors are ordinary text. `--json` produces compact JSON
 for data commands. Do not parse human formatting or interpret an exit code of
 zero from `submit` as evidence that the experiment has finished.
+Submitted program output is captured in files rather than streamed by submit.
+
+## instructions
+
+Use Runwarden (rmgr) for native experiments on this workstation. Read
+`rmgr manual ownership` and `rmgr manual limits` before submitting work;
+use `rmgr manual jobs` and command-specific `--help` for syntax and details.
+
+Use the shared daemon/state directory. Check `rmgr health --json` and
+`rmgr resources --json` before submission. Do not start a separate daemon to
+bypass a queue or run an experiment outside the manager when admission fails.
+
+Submit the target command directly; no wrapper script is required:
+
+    rmgr submit --id-only --receipt /private/persistent/run.receipt.json \
+      --cores N --memory SIZE --timeout SECONDS -- PROGRAM ARGUMENTS
+
+Choose resources to fit the available configuration and set the program's worker
+counts explicitly. Use the intended environment's executable. Use separate run
+directories and preserve inputs until jobs finish. Submission returns immediately;
+use `rmgr wait JOB_ID`, `rmgr inspect JOB_ID`, and `rmgr logs JOB_ID` to monitor it.
+Program stdout/stderr go to files in job cwd by default. Inspect returns their
+paths. Optional --stdout/--stderr select new files; existing targets are not
+overwritten. The manager keeps its own records centrally.
+
+A public job ID is NOT the secret control_token. List/inspect expose job IDs,
+not control keys. Submission generates a random key and saves it in your receipt
+before contacting the daemon. With --id-only the key stays out of terminal
+output; otherwise submit/retry also print it. The target program is not given
+the key. Read-only queries are shared; cancelling requires the matching key.
+
+Use a new receipt path for each new job. Keep receipts private, persistent, and
+out of version control. Record your job IDs and receipt paths in your own handoff
+notes across conversation restarts; do not copy the keys into shared notes.
+The manager cannot remember those paths on an agent's behalf. A temporary
+directory that may be cleaned up is unsuitable for long-term recovery.
+
+After a lost submission response, use `rmgr retry --id-only --receipt PATH`.
+An already-accepted request returns its original job ID without executing again;
+if it was never accepted, retry submits the saved request. To cancel, use
+`rmgr cancel JOB_ID --receipt PATH`. Only cancel jobs you submitted or for which
+the user explicitly delegated authority and supplied the matching receipt.
+Do not search for/reuse another agent's receipts or bypass the API with direct
+process/service control. There is no job-editing API or lost-key recovery API.
+
+The --exclusive flag means running alone among managed jobs; it does not grant
+ownership or replace the control key. Keys prevent accidental API interference,
+not unrestricted access by other processes under the same Linux account.
 
 ## jobs
 
@@ -47,6 +102,10 @@ the target program's arguments, including its own flags. The manager queues
 and launches that program when resources become available. `program | rmgr`
 is not supported: the shell would start the program before admission and pipe
 its output instead of submitting its command.
+Jobs have no interactive stdin. To use shell operators, submit the shell itself:
+
+    rmgr submit --receipt ./sleep.receipt.json --cores 16 --memory 64M \
+      -- bash -c 'sleep 10 && echo "finished"'
 
 Choose a private receipt path unique to this submission and an experiment
 directory that other jobs will not modify:
@@ -66,6 +125,23 @@ overwritten: use retry to repeat a submission, or a new path for a new run.
     rmgr wait JOB_ID --timeout 30 --json
     rmgr cancel JOB_ID --receipt ./experiment-01.receipt.json
 
+New jobs write rmgr-JOB_ID.stdout.log and rmgr-JOB_ID.stderr.log in their cwd.
+Use --stdout stdout.log --stderr stderr.log to choose filenames; relative paths
+resolve against job cwd, and absolute paths are accepted. Parent directories
+must exist. Output files are created at launch with mode 0600 and never overwrite
+or append existing files. Use separate paths for stdout and stderr. A collision,
+unwritable directory, or symlink causes launch failure; check inspect's reason.
+Failed launches may leave newly created empty files. Retention is manual.
+
+Submit/inspect/list expose stdout_path and stderr_path. The logs command reads
+those files and returns path and available along with the text/cursors. Missing
+files (including files not created yet or moved/deleted later) return available=false
+and empty text. A replaced file or other read failure returns LOG_UNAVAILABLE.
+Keep outputs at their recorded paths for API retrieval. The central state stores
+metadata, launch diagnostics, and file identities, not new jobs' program output.
+Launcher failures remain in the central launch-error.txt/job reason and journal;
+they are not mixed into the target program's stderr.
+
 Use each log response's `next_offset` for the next read; offsets/limits count
 bytes. `more` means more bytes were available at that read, not that the job is
 finished. Poll again later while the job runs. Default chunk size is 16 KiB;
@@ -79,6 +155,8 @@ Retry sends the original command, request ID, and token. It returns the same job
 if already accepted, including if that job has finished. It does not rerun a
 failed job. A deliberate rerun needs a new receipt/request ID. If receipt
 creation itself fails, no request is sent. Do not edit a receipt to change a job.
+Already-accepted retries still work if the old cwd disappeared, resource capacity
+changed, or admission is degraded; genuinely new submissions are still validated.
 
 To construct a dependency chain or branch:
 
@@ -103,10 +181,15 @@ resources to avoid starving the first ready job.
       "exclusive": true,
       "timeout_seconds": 600,
       "after_success": [],
-      "env": {"OMP_NUM_THREADS": "8"}
+      "env": {"OMP_NUM_THREADS": "8"},
+      "stdout": "stdout.log",
+      "stderr": "stderr.log"
     }
 
-argv and cwd are required. JSON executable/cwd paths must be absolute. CLI
+argv and cwd are required; stdout/stderr are optional (or null for defaults).
+With --spec, put job settings in JSON: command-line resource/cwd/environment/output
+options do not override the file. Receipt and request-id options still apply.
+JSON executable/cwd paths must be absolute. CLI
 executable names are resolved by the submitting client. Defaults: 1 physical
 core, 1 GiB RAM, no GPU, nonexclusive, 3600 seconds, no dependencies or explicit
 environment entries. Minimum RAM is 64 MiB; requests must fit configured
@@ -175,6 +258,12 @@ history. Old jobs have no token and cannot be cancelled through the new API.
 Finish/cancel old jobs with 0.1 before upgrading. Legacy history remains readable;
 there is no automatic adoption or creation of credentials for somebody else's job.
 
+Version 0.3 adds persisted output paths. Existing jobs and receipts retain their
+old behavior: even pre-upgrade queued jobs keep central stdout.log/stderr.log
+paths. New submissions use working-directory outputs. No historical files are
+moved. Stop the scheduler, back up state, upgrade the package, and restart it.
+Do not replace package files while a launcher is starting.
+
 For direct local API clients: submit requests contain op="submit", request_id,
 spec, and control_token. Generate/save a token before calling. Cancel requests
 contain op="cancel", job_id, and control_token. Send one JSON line to the
@@ -228,6 +317,10 @@ The default daemon state directory is $XDG_STATE_HOME/rmgr, or
 checks the caller's Linux UID. All agents must point at the same state directory.
 A different --home creates a separate resource pool, not an isolated share of
 the same hardware; do not use that to work around pending jobs.
+Service actions manage one fixed rmgr.service. Only render/install embed the
+chosen --home in that service; start/stop/restart/status do not select another
+unit based on --home. Drain jobs before changing configured resource capacity;
+queued requests are not resized and may stop fitting after a reduction.
 
 `health` checks the API, SQLite and systemd connection; it reports ready or
 degraded. `resources` reports CPU/RAM/GPU reservations. `doctor` additionally
@@ -259,6 +352,8 @@ Common errors:
 - WRONG_DAEMON: supply the receipt's original --home.
 - REQUEST_CONFLICT: the request ID belongs to a different specification.
 - LEGACY_JOB: the job predates tokens; operator handling is required.
+- LOG_UNAVAILABLE: a recorded output was replaced, is not a regular file, or
+  could not be read. Inspect the recorded path and preserve the original output.
 - INVALID_REQUEST / NOT_FOUND: inspect arguments, resource capacity and job IDs.
 - BUSY: doctor cannot probe without potentially disturbing managed work.
 

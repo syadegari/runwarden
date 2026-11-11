@@ -17,6 +17,9 @@ class Scheduler:
     def submit(self, request_id: str, specification: dict, control_token: str) -> dict:
         text(request_id, "request_id")
         require(len(request_id) <= 200, "request_id is too long")
+        existing = self.store.retry(request_id, specification, control_token)
+        if existing is not None:
+            return existing
         spec = JobSpec.from_dict(specification, self.config)
         require(len(json.dumps(spec.to_dict())) <= 65536, "Job specification must be <= 64 KiB")
         return self.store.submit(request_id, spec, control_token)

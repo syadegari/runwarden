@@ -64,3 +64,14 @@ releases. Version 0.2 adds control-token hashes without replacing history;
 finish/cancel 0.1 jobs before upgrading because those jobs have no token and
 cannot be cancelled through the new API. Private client receipts must also be
 preserved. Do not upgrade package files while a job launcher is starting.
+
+Version 0.3 adds output-path columns and writes new jobs' stdout/stderr in their
+working directories. Existing history and queued/running jobs keep their central
+output paths; old receipts still work. No output files are relocated. Upgrade
+both the CLI and daemon package and restart the daemon before relying on the new
+behavior. `inspect` reports the exact stdout_path/stderr_path for either layout.
+
+Changing capacity is separate from upgrading: drain managed work before reducing
+CPU/RAM/GPU capacity, because queued jobs keep their original requests. All
+service lifecycle commands manage the same rmgr.service; --home affects its
+rendered/installed configuration, not the unit selected by start/stop/status.

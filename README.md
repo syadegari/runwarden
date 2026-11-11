@@ -12,19 +12,18 @@ the exact evidence and remaining workload checks.
 
 ## Point an agent at the tool
 
-Give the agent these instructions:
+Tell the agent: **"Run `rmgr instructions` and follow the printed instructions
+before submitting experiments."**
 
-> Run `rmgr manual`, then read `rmgr manual ownership` and `rmgr manual limits`.
-> Submit experiments with `rmgr submit --receipt /private/path/run.receipt.json
-> [resource options] -- PROGRAM [arguments]`. Use a new receipt path for each
-> new job and keep it private and out of version control. The receipt contains
-> that job's secret control key; preserve it across conversation restarts.
-> To retry a submission after a lost response, use `rmgr retry --receipt PATH`.
-> To cancel your job, use `rmgr cancel JOB_ID --receipt PATH`.
-> Read-only queries are shared, but a job ID alone does not authorize control.
-> Do not search for or reuse another agent's receipts, or bypass the API with
-> direct process/service control. Cancel only jobs you submitted or for which
-> the user explicitly delegated authority and supplied the matching receipt.
+```bash
+rmgr instructions         # Readable instructions on stdout
+rmgr instructions --json  # The same text with version/topic metadata
+```
+
+This works offline without a daemon or state directory. The instructions cover
+direct command submission, resource limits, monitoring, private control keys,
+and preserving receipt paths in handoff notes. They are also available through
+`rmgr manual instructions`, so the installed package has one source of truth.
 
 The per-job `control_token` is generated automatically and required by the API
 for cancellation and submission retries. There is no API to edit a submitted
@@ -67,7 +66,11 @@ The manager's Python and a job's Python can be different versions/environments.
 `init` writes configuration only if absent. Its default directory is
 `$XDG_STATE_HOME/rmgr`, or `~/.local/state/rmgr`. The directory must be private
 (mode 0700). It contains `config.json`, `jobs.sqlite3`, a private control socket,
-and per-job manifests/logs. `--home /absolute/path` overrides it for every command.
+and per-job launch records/diagnostics. New jobs write program stdout/stderr to
+their working directories, not this database or central directory.
+`--home /absolute/path` selects the daemon state directory. Service lifecycle
+commands always manage the single `rmgr.service`; `--home` changes the state
+path embedded by `service render` or `service install`, not which unit is managed.
 Use one shared daemon/state directory for all agents using this machine.
 
 `doctor` starts a short, one-core, 64 MiB probe and verifies the actual CPU and
@@ -83,7 +86,9 @@ separately if the service must start at boot and survive logout.
 
 ## Configure resources
 
-Edit `config.json` while the service is stopped, then restart it. For example:
+Finish/cancel managed work, stop the service, edit `config.json`, then start it.
+Queued jobs retain their original resource requests; reducing capacity below
+those requests can leave them waiting indefinitely. For example:
 
 ```json
 {
@@ -136,6 +141,14 @@ control its workers. Submission queues the command and returns a job ID; use
 `wait` for completion and `logs` for output. A pipe such as `program | rmgr`
 would start the program immediately and pipe its output, bypassing admission
 and launch-time resource enforcement. It is not a submission interface.
+Submission does not stream the program's output to your terminal. Use `logs`
+or read the output files below. Jobs have no interactive stdin. Shell syntax
+such as `&&` must be part of an explicitly submitted shell command:
+
+```bash
+rmgr submit --receipt ./sleep-01.receipt.json --cores 16 --memory 64M \
+  -- bash -c 'sleep 10 && echo "finished"'
+```
 
 ```bash
 rmgr submit --receipt ./experiment-01.receipt.json --request-id experiment-01 --cores 8 --memory 16G \
@@ -172,14 +185,59 @@ are saved in job history, so avoid putting secrets in them.
 
 For structured submission, `rmgr submit --receipt ./job.receipt.json --spec job.json --request-id stable-key`
 accepts fields `argv`, `cwd`, `cores`, `memory_bytes`, `gpu`, `exclusive`,
-`timeout_seconds`, `after_success`, and `env`. In JSON, the executable and cwd
+`timeout_seconds`, `after_success`, `env`, `stdout`, and `stderr`. In JSON, the executable and cwd
 must be absolute. Unknown fields and impossible requests are rejected.
+With `--spec`, put all job settings in the JSON file; command-line job options
+do not override it. `--receipt` and `--request-id` still apply to submission.
 
 The CLI saves a private receipt before sending the request. After a lost
 response, run `rmgr retry --receipt ./job.receipt.json`; the same request ID,
 specification, and control token return the original job. Reusing another
 caller's request ID does not grant control. A deliberate rerun needs a new
 receipt/request ID. Existing receipt files are never overwritten.
+
+## Program output and manager records
+
+Starting with 0.3, each new job writes these files in its `--cwd` (default: the
+directory from which you submit):
+
+```text
+rmgr-JOB_ID.stdout.log
+rmgr-JOB_ID.stderr.log
+```
+
+Use explicit names when each experiment has its own run directory:
+
+```bash
+rmgr submit --receipt ./run-02.receipt.json --cwd /path/to/experiment \
+  --stdout stdout.log --stderr stderr.log --cores 16 --memory 8G \
+  -- /path/to/python -m fe_solver solve run.toml --solver-backend superlu_mt --num-threads 16
+```
+
+Relative output paths are relative to the job's cwd; absolute paths also work.
+Parent directories must already exist. The launcher creates private regular
+files (mode 0600) when the job starts. Existing files, symlinks, and output-path
+collisions cause launch failure rather than overwriting/appending another run.
+A failed launch can leave empty files it created before the failure.
+
+Submission and `inspect` return `stdout_path` and `stderr_path`. `rmgr logs`
+reads those files; it also returns `path` and `available`. Before creation, or
+if a file/directory was removed or moved, it returns `available: false` and empty
+text. Replacing a new job's output file produces `LOG_UNAVAILABLE`, so a different
+file is not silently presented as that job's output. Keep output files at their
+recorded locations if you want to retrieve them through the API.
+
+SQLite stores job metadata and output paths, not program output. The central
+`jobs/JOB_ID/` directory keeps the launch manifest, output-file identity record,
+and any `launch-error.txt`. Launcher errors are exposed in the job's `reason`
+and the journal, not mixed into program stderr. Scheduler messages are in
+`journalctl --user -u rmgr.service`. Retention of both records and output files
+is manual.
+
+On upgrade, existing jobs (including queued jobs) keep their old central output
+paths; `rmgr logs` continues to read them. Existing receipts remain valid. Back
+up the state directory, stop the scheduler, reinstall the package, and restart
+it to enable 0.3 behavior. Do not replace package files while a launcher starts.
 
 ## Job control tokens
 
@@ -239,17 +297,21 @@ and `interrupted`. CLI exit codes: 0 success, 2 API/configuration/service error,
 Argparse usage errors also return 2. `inspect` returns 0 for an existing job
 regardless of that job's outcome.
 
-Logs are byte-cursor based and bounded per response. A UTF-8 character split at
+Program-output reads are byte-cursor based and bounded per response. A UTF-8 character split at
 a cursor can be replaced in the displayed text; the stored log bytes remain
 unchanged. Disk log retention is manual in this first version. Input files and
 executables are not snapshotted: preserve an experiment's checkout/deck until it
 finishes. History stores the submitted command and environment, not automatic
-source revision discovery.
+source revision discovery. Data commands return indented JSON by default;
+`--json` makes it compact. `instructions`, `manual`, help, `service render`, and submission with
+`--id-only` have plain-text output; there is no table mode for `list`.
 
 ## Development and boundaries
 
 See [demo jobs](docs/demo-jobs.md) for two CUDA simulations, two 16-thread native
 FE benchmarks, submission commands, monitoring, and persistent logs.
+The [code/documentation audit](docs/code-documentation-audit.md) records the
+0.3 consistency review, fixes, and validation boundaries.
 
 ```bash
 python3 -m unittest discover -s tests -v

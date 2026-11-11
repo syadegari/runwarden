@@ -1,5 +1,26 @@
 # Validation and workloads
 
+## Output separation and consistency audit on 2026-11-11
+
+The 0.3 source changes were checked with the complete 60-test suite using host
+systemd/Unix-socket access: all tests passed with no skips (6.414 seconds).
+This includes live custom output paths, launch diagnostics kept separate from
+program stderr, collisions that fail only the affected job, and legacy queued
+jobs retaining central output paths. Filesystem tests also cover default paths,
+permissions, persistence, schema/receipt compatibility, missing or replaced
+outputs, and retries after cwd/resource changes.
+
+The installed production daemon was ready with zero running/queued jobs before
+testing. Tests used temporary state with at most two cores and 512 MiB; they did
+not upgrade that installation or modify its configuration. See the
+[audit report](code-documentation-audit.md) for scope, corrections and limits.
+After the API readiness fix, all 39 interface/output/control tests passed.
+An offline-built 0.3 wheel also passed a disposable installed-daemon check:
+one job continued through an actual daemon-process restart, then both program
+streams were read through the CLI from its working-directory output files.
+The later offline instructions command brought the suite to 61 tests; its
+sandbox run passed 53 tests with eight host-only checks skipped.
+
 ## Host validation on 2026-11-10
 
 The source checkout at `72df7dc` passed all 47 tests with no skips using:
@@ -19,8 +40,7 @@ The existing service had no running or queued jobs before the tests. Tests used
 private temporary state and did not change host configuration or the installed
 package. The service's pipx installation still contained the older GPU reporting
 code (`gpu_device_access`); these results validate the source checkout, not an
-upgrade of that installation. Real GPU and managed FE workloads remain unverified
-by this run.
+upgrade of that installation. GPU and FE workloads were checked separately below.
 
 ## Native FE interoperability on 2026-11-10
 
@@ -74,8 +94,9 @@ daemon; the CPU mocks were only smoke-tested at two threads.
 
 ## Earlier sandbox evidence
 
-- The suite runs under Python 3.12 and Conda `py3.14`; five host/socket checks
-  remain skipped because the required execution capabilities are unavailable.
+- The earlier suite ran under Python 3.12 and Conda `py3.14`; five host/socket
+  checks were skipped inside the restricted sandbox. Later approved host
+  validation is recorded above.
 - Python scheduler/interface tests exercise core and memory admission, whole-job
   exclusivity, GPU serialization, FIFO fairness, dependency failure, idempotency,
   cancellation, lost launch replies, missing-unit recovery, logs, and CLI behavior.
@@ -92,13 +113,14 @@ daemon; the CPU mocks were only smoke-tested at two threads.
   balance was approximately 4.95e-15. This was a direct workload smoke test,
   not a run through the resource manager.
 - The two-process FE smoke attempt was blocked by sandbox IPC permissions.
-- The systemd bus and Unix listening sockets are blocked in this sandbox.
-  Kernel cgroup enforcement, live daemon restart, and native parallel FE workloads
-  therefore remain host-validation work. Pure scheduler tests do not prove them.
-- NVIDIA driver access is unavailable here. GPU reservation logic is tested;
-  real GPU execution is not verified.
-- SuperLU_MT native compilation and PETSc execution were not tested. PETSc is
-  on the upstream `feature/iterative-solvers` branch, not main.
+- The sandbox blocked systemd and Unix sockets. Subsequent host tests above
+  exercised cgroups and native benchmarks. Pure scheduler tests alone do not
+  establish kernel enforcement or actual daemon-process restart behavior.
+- NVIDIA driver access was unavailable in the sandbox; later approved host
+  checks verified actual GPU kernels as recorded above.
+- SuperLU_MT compilation and PETSc execution were not tested; native host checks
+  reused a built bridge. At the time of this earlier inspection, PETSc was on
+  upstream `feature/iterative-solvers`, not main.
 
 ## Run the host suite first
 

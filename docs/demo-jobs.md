@@ -1,10 +1,14 @@
 # GPU simulations and 16-thread FE benchmarks
 
+The commands and helper below target Runwarden 0.3. Upgrade the installed package
+and restart the daemon before using --stdout/--stderr.
+
 For ordinary jobs, submit your program directly:
 
 ```bash
 rmgr submit --receipt ./solve-01.receipt.json --cores 16 --memory 8G \
   --timeout 600 --cwd /path/to/fe_solver \
+  --stdout stdout.log --stderr stderr.log \
   -- /path/to/envs/py3.14/bin/python -m fe_solver solve /path/to/run.toml \
   --solver-backend superlu_mt --num-threads 16
 ```
@@ -17,7 +21,9 @@ returns immediately; use the monitoring commands below to follow the run.
 The helper below is optional convenience for submitting the paired demos.
 Run its commands from this repository's root. It creates a fresh
 private directory under `build/demo-runs/` with receipts and a `jobs.json` index.
-It prints the job IDs immediately; jobs continue after the command exits.
+It also writes each job's program output there as NAME.stdout.log and
+NAME.stderr.log, with paths saved in the index. It prints the job IDs immediately;
+jobs continue after the command exits.
 
 ## Minimal scheduling check
 
@@ -132,16 +138,23 @@ The API defaults to 16 KiB per response. For longer logs, use `--offset` with
 the previous response's `next_offset`, or read the complete files directly:
 
 ```bash
-state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/rmgr"
-tail -F "$state_dir/jobs/JOB_ID/stdout.log" "$state_dir/jobs/JOB_ID/stderr.log"
+job=JOB_ID
+stdout_path=$(rmgr inspect "$job" --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["stdout_path"])')
+stderr_path=$(rmgr inspect "$job" --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["stderr_path"])')
+tail -F "$stdout_path" "$stderr_path"
 # After completion (also works with the daemon stopped):
-less "$state_dir/jobs/JOB_ID/stdout.log"
-cat "$state_dir/jobs/JOB_ID/stderr.log"
+less "$stdout_path"
+cat "$stderr_path"
 ```
 
-Replace `JOB_ID` in paths as well as commands. For a custom state directory,
-use its path and pass `rmgr --home /that/path` to CLI commands. `tail -F` keeps
+Set `job` to the printed job ID. Get/save the paths while the daemon is running;
+the files can then be read directly even while it is stopped. For a custom state
+directory, pass `rmgr --home /that/path` to CLI commands. `tail -F` keeps
 waiting after a job finishes; Ctrl-C stops the viewer, not the job.
+Old jobs keep their pre-upgrade central paths. New jobs default to unique
+rmgr-JOB_ID.stdout.log / rmgr-JOB_ID.stderr.log files in job cwd. Explicit paths
+must not already exist. If output files are moved or deleted, logs reports
+available=false; the manager does not keep another copy of program output.
 
 To cancel your own job, use its saved receipt:
 
