@@ -1,10 +1,12 @@
 """Admission and state transitions, independent of the execution backend."""
 
 import json
+import sqlite3
 import time
 
 from .models import ACTIVE, TERMINAL, Config, JobSpec, RmgrError, require, text
 from .store import Store
+from .protocol import MAX_SPEC_BYTES
 
 
 class Scheduler:
@@ -21,16 +23,24 @@ class Scheduler:
         if existing is not None:
             return existing
         spec = JobSpec.from_dict(specification, self.config)
-        require(len(json.dumps(spec.to_dict())) <= 65536, "Job specification must be <= 64 KiB")
+        require(len(json.dumps(spec.to_dict())) <= MAX_SPEC_BYTES, "Job specification must be <= 64 KiB")
         return self.store.submit(request_id, spec, control_token)
+
+    def operator_cancel(self, job_id: str, reason: str) -> dict:
+        text(reason, "reason")
+        require(bool(reason.strip()) and len(reason) <= 1000, "Operator reason must contain 1–1000 characters")
+        job = self.store.operator_cancel(job_id, reason)
+        if job["state"] == "cancelling":
+            self.backend.cancel(job)
+        return self.store.get(job_id)
 
     def cancel(self, job_id: str, control_token: object) -> dict:
         job = self.store.authorize(job_id, control_token)
         if job["state"] == "queued":
-            self.store.update(job_id, state="cancelled", finished=time.time(), reason="Cancelled before launch")
+            self.store.update(job_id, state="cancelled", finished=time.time(), reason="Cancelled before launch", reason_details=None)
         elif job["state"] in ACTIVE:
             # Persist intent first. Restart recovery will repeat a stop if necessary.
-            self.store.update(job_id, state="cancelling", reason="Cancellation requested")
+            self.store.update(job_id, state="cancelling", reason="Cancellation requested", reason_details=None)
             self.backend.cancel(job)
         return self.store.get(job_id)
 
@@ -47,7 +57,9 @@ class Scheduler:
                 continue
             state = "cancelled" if job["state"] == "cancelling" else observation.state
             self.store.update(job["id"], state=state, finished=time.time(),
-                              reason=observation.reason, exit_code=observation.exit_code)
+                              reason=job["reason"] if state == "cancelled" else observation.reason,
+                              reason_details=job.get("reason_details") if state == "cancelled" else None,
+                              exit_code=observation.exit_code)
             self.backend.forget(job)
 
     def tick(self) -> None:
@@ -57,7 +69,11 @@ class Scheduler:
             self.error = None
         except RmgrError as exc:
             # Unknown backend state means resources stay reserved and admission stops.
-            self.error = {"code": exc.code, "message": str(exc)}
+            self.error = exc.to_dict()
+        except (OSError, sqlite3.Error) as exc:
+            # Persisted allocations remain authoritative; a later tick reconciles
+            # them before admission. Never turn storage uncertainty into a replay.
+            self.error = {"code": "STORAGE_UNAVAILABLE", "message": str(exc)}
 
     def admit(self) -> None:
         jobs = self.store.all()
@@ -75,38 +91,52 @@ class Scheduler:
             spec = job["spec"]
             dependencies = [by_id[dep] for dep in spec["after_success"]]
             if any(dep["state"] in TERMINAL - {"succeeded"} for dep in dependencies):
-                self.store.update(job["id"], state="blocked", finished=time.time(), reason="A dependency did not succeed")
+                self.store.update(job["id"], state="blocked", finished=time.time(), reason="A dependency did not succeed",
+                                  reason_details={"code": "DEPENDENCY_FAILED", "blocking_job_ids": [d["id"] for d in dependencies if d["state"] in TERMINAL - {"succeeded"}]})
                 by_id[job["id"]] = self.store.get(job["id"])
                 continue
             if any(dep["state"] != "succeeded" for dep in dependencies):
-                self.store.update(job["id"], reason="Waiting for successful dependencies")
+                self.store.update(job["id"], reason="Waiting for successful dependencies", reason_details={"code": "DEPENDENCIES", "blocking_job_ids": [d["id"] for d in dependencies if d["state"] != "succeeded"]})
                 continue
             if barrier:
-                self.store.update(job["id"], reason=f"Waiting behind job {barrier}")
+                self.store.update(job["id"], reason=f"Waiting behind job {barrier}", reason_details={"code": "FIFO_BARRIER", "blocking_job_ids": [barrier]})
                 continue
             reason = None
+            details = {"blocking_job_ids": [j["id"] for j in active]}
             if exclusive_busy:
                 reason = "An exclusive job is running"
+                details.update(code="EXCLUSIVE_RUNNING", blocking_job_ids=[j["id"] for j in active if j["spec"]["exclusive"]])
             elif spec["exclusive"] and active:
                 reason = "Waiting for running jobs to drain for exclusive execution"
+                details.update(code="EXCLUSIVE_DRAIN")
             elif len(available) < spec["cores"]:
                 reason = "Waiting for physical cores"
+                details.update(code="CPU_RESERVATION", requested_cores=spec["cores"], available_cores=len(available))
             elif memory < spec["memory_bytes"]:
                 reason = "Waiting for memory reservation"
+                details.update(code="MEMORY_RESERVATION", requested_bytes=spec["memory_bytes"], available_bytes=memory)
             elif spec["gpu"] and gpu_busy:
                 reason = "Waiting for GPU reservation"
+                details.update(code="GPU_RESERVATION", blocking_job_ids=[j["id"] for j in active if j["spec"]["gpu"]])
             if reason:
                 # FIFO among ready jobs avoids starvation without needing runtime prediction.
                 barrier = job["id"]
-                self.store.update(job["id"], reason=reason)
+                self.store.update(job["id"], reason=reason, reason_details=details)
                 continue
             allocation = available[:spec["cores"]]
             self.store.update(job["id"], state="starting", allocation=allocation,
-                              started=time.time(), reason=None)
+                              started=time.time(), reason=None, reason_details=None)
             job = self.store.get(job["id"])
             # On ambiguous launch errors leave STARTING durable. Reconciliation determines
             # whether a unit exists; never blindly replay the command after a crash.
-            self.backend.launch(job)
+            try:
+                self.backend.launch(job)
+            except RmgrError as exc:
+                if exc.code != "LAUNCH_PREPARATION_FAILED":
+                    raise
+                self.store.update(job["id"], state="failed", finished=time.time(), started=None,
+                                  allocation=None, reason=str(exc), reason_details={"code": exc.code})
+                continue
             self.store.update(job["id"], state="running")
             available = available[spec["cores"]:]
             memory -= spec["memory_bytes"]

@@ -14,9 +14,13 @@ TERMINAL = {"succeeded", "failed", "cancelled", "timed_out", "oom", "blocked", "
 
 
 class RmgrError(Exception):
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, **details):
         super().__init__(message)
         self.code = code
+        self.details = details
+
+    def to_dict(self):
+        return {"code": self.code, "message": str(self), **self.details}
 
 
 def require(condition: bool, message: str) -> None:

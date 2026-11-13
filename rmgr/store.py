@@ -43,11 +43,18 @@ class Store:
             if f"{stream}_path" not in columns:
                 # NULL means the legacy central location; never move old outputs.
                 self.db.execute(f"ALTER TABLE jobs ADD COLUMN {stream}_path TEXT")
+        if "reason_details" not in columns:
+            self.db.execute("ALTER TABLE jobs ADD COLUMN reason_details TEXT")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS operator_actions (
+            id INTEGER PRIMARY KEY, job_id TEXT NOT NULL, created REAL NOT NULL,
+            peer_uid INTEGER NOT NULL, reason TEXT NOT NULL, previous_state TEXT NOT NULL
+        )""")
         self.db.commit()
 
     def decode(self, row) -> dict:
         job = dict(row)
         job.pop("control_token_hash", None)
+        job["reason_details"] = json.loads(job["reason_details"]) if job["reason_details"] else None
         job["spec"] = json.loads(job["spec"])
         job["allocation"] = json.loads(job["allocation"]) if job["allocation"] else None
         for stream in ("stdout", "stderr"):
@@ -81,6 +88,28 @@ class Store:
     def all(self) -> list[dict]:
         return [self.decode(row) for row in self.db.execute("SELECT * FROM jobs ORDER BY created, rowid")]
 
+    def lookup(self, request_id: str) -> dict | None:
+        require(isinstance(request_id, str) and bool(request_id), "request_id must be a nonempty string")
+        row = self.db.execute("SELECT * FROM jobs WHERE request_id = ?", (request_id,)).fetchone()
+        return self.decode(row) if row else None
+
+    def operator_cancel(self, job_id: str, reason: str) -> dict:
+        from .models import ACTIVE
+        job = self.get(job_id)
+        # Audit and cancellation intent must commit together, before stopping a unit.
+        with self.db:
+            self.db.execute("INSERT INTO operator_actions (job_id, created, peer_uid, reason, previous_state) VALUES (?, ?, 0, ?, ?)",
+                            (job_id, time.time(), reason, job["state"]))
+            if job["state"] == "queued" or job["state"] in ACTIVE:
+                queued = job["state"] == "queued"
+                self.db.execute("UPDATE jobs SET state = ?, finished = ?, reason = ?, reason_details = ? WHERE id = ?",
+                                ("cancelled" if queued else "cancelling", time.time() if queued else None,
+                                 f"Operator cancellation: {reason}", json.dumps({"code": "OPERATOR_CANCEL", "peer_uid": 0}), job_id))
+        return self.get(job_id)
+
+    def operator_actions(self, job_id: str) -> list[dict]:
+        return [dict(row) for row in self.db.execute("SELECT * FROM operator_actions WHERE job_id = ? ORDER BY id", (job_id,))]
+
     def submit(self, request_id: str, spec: JobSpec, control_token: str) -> dict:
         digest = token_digest(control_token)
         payload = json.dumps(spec.to_dict(), sort_keys=True)
@@ -112,11 +141,13 @@ class Store:
         return row["stdout_path"] is None
 
     def update(self, job_id: str, **fields) -> None:
-        allowed = {"state", "started", "finished", "allocation", "reason", "exit_code"}
+        allowed = {"state", "started", "finished", "allocation", "reason", "reason_details", "exit_code"}
         if not fields or not fields.keys() <= allowed:
             raise ValueError("Invalid job update")
         if "allocation" in fields:
             fields["allocation"] = json.dumps(fields["allocation"])
+        if "reason_details" in fields:
+            fields["reason_details"] = json.dumps(fields["reason_details"]) if fields["reason_details"] is not None else None
         columns = ", ".join(f"{name} = ?" for name in fields)
         with self.db:
             self.db.execute(f"UPDATE jobs SET {columns} WHERE id = ?", (*fields.values(), job_id))
