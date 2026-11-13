@@ -7,6 +7,10 @@ from .models import RmgrError
 
 
 COMMAND_HELP = {
+    "describe": "Discover command arguments, constraints, and contracts offline as JSON",
+    "validate": "Validate an effective job specification without creating a receipt or reserving resources",
+    "lookup": "Find an existing job from a receipt without submitting or exposing its token",
+    "admin-cancel": "Operator-only cancellation without a job key; requires a root socket peer and an audit reason",
     "instructions": "Print agent onboarding instructions to stdout; no daemon required",
     "manual": "Read the offline usage guide; start with 'rmgr manual'",
     "init": "Create configuration without replacing existing settings",
@@ -14,6 +18,7 @@ COMMAND_HELP = {
     "doctor": "Probe enforcement while the daemon and jobs are stopped",
     "health": "Check daemon, database, and backend readiness",
     "resources": "Show configured capacity and current reservations",
+    "status": "Show a human-readable overview of capacity and active jobs",
     "submit": "Save a private receipt and enqueue a command or JSON specification",
     "retry": "Resubmit a saved receipt safely after a lost response",
     "list": "List public job information with bounded pagination",
