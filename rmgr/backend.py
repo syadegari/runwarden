@@ -62,11 +62,15 @@ class SystemdBackend:
     def launch(self, job: dict) -> None:
         spec = job["spec"]
         directory = self.home / "jobs" / job["id"]
-        directory.mkdir(mode=0o700)
         manifest = directory / "launch.json"
         outputs = {stream: job.get(f"{stream}_path", str(directory / f"{stream}.log"))
                    for stream in ("stdout", "stderr")}
-        manifest.write_text(json.dumps({"spec": spec, "cpu_ids": job["allocation"], "output_paths": outputs}))
+        try:
+            directory.mkdir(mode=0o700)
+            manifest.write_text(json.dumps({"spec": spec, "cpu_ids": job["allocation"], "output_paths": outputs}))
+        except OSError as exc:
+            # No systemd command has run: this failure is known to precede execution.
+            raise RmgrError("LAUNCH_PREPARATION_FAILED", str(exc)) from exc
         properties = {
             "Type": "exec",
             "ExitType": "cgroup",

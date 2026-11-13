@@ -8,12 +8,17 @@ import os
 from pathlib import Path
 import signal
 import socket
+import sqlite3
 import stat
 import struct
+import time
 
 from . import __version__
 from .backend import SystemdBackend, gpu_capabilities
-from .models import ACTIVE, Config, RmgrError, integer, prepare_home, require
+from .models import ACTIVE, TERMINAL, Config, JobSpec, RmgrError, integer, prepare_home, require
+from .protocol import MAX_LOG_BYTES, MAX_SPEC_BYTES, runtime_capabilities
+from .runner import environment
+from .snapshots import Snapshots
 from .scheduler import Scheduler
 from .store import Store
 
@@ -30,11 +35,56 @@ class API:
         self.capabilities = dict(capabilities)
         self.capabilities.pop("gpu_device_access", None)
         self.capabilities.update(gpu_capabilities(scheduler.config))
+        self.snapshots = Snapshots()
 
-    def dispatch(self, request: dict) -> dict:
+    def dispatch(self, request: dict, *, peer_uid=None) -> dict:
         require(isinstance(request, dict), "Request must be an object")
         operation = request.get("op")
         store = self.scheduler.store
+        if operation == "admin_cancel":
+            # This value is supplied by connection(), NEVER by request JSON.
+            if peer_uid != 0:
+                raise RmgrError("OPERATOR_REQUIRED", "Operator cancellation requires a root Unix-socket peer (sudo)")
+            job = self.scheduler.operator_cancel(request.get("job_id"), request.get("reason"))
+            return {**job, "operator_actions": store.operator_actions(job["id"])}
+        if operation == "lookup":
+            job = store.lookup(request.get("request_id"))
+            return {"found": job is not None, "request_id": request.get("request_id"), "job": job}
+        if operation == "validate":
+            spec = JobSpec.from_dict(request.get("spec"), self.scheduler.config)
+            require(len(json.dumps(spec.to_dict())) <= MAX_SPEC_BYTES, "Job specification must be <= 64 KiB")
+            require(Path(spec.argv[0]).is_file() and os.access(spec.argv[0], os.X_OK), "Executable must exist and be executable")
+            warnings = []
+            for dep in spec.after_success:
+                job = store.get(dep)
+                if job["state"] in TERMINAL - {"succeeded"}:
+                    warnings.append(f"Dependency {dep} did not succeed; this job would be blocked")
+            for stream in ("stdout", "stderr"):
+                value = getattr(spec, stream)
+                if value is not None:
+                    path = Path(spec.cwd) / value
+                    require(not os.path.lexists(path), f"{stream} target already exists: {path}")
+                    require(path.parent.is_dir() and os.access(path.parent, os.W_OK), f"{stream} parent must exist and be writable")
+                else:
+                    require(os.access(spec.cwd, os.W_OK), "cwd must be writable for default output files")
+            if self.scheduler.error:
+                warnings.append("Scheduler is degraded; new submission is currently unavailable")
+            return {"valid": True, "spec": spec.to_dict(), "effective_environment": environment(spec.to_dict()),
+                    "resources": self.scheduler.resources(), "warnings": warnings,
+                    "reserved": False, "note": "Checks current configuration and paths only; does not guarantee admission or future launch"}
+        if operation == "list_snapshot":
+            def capture():
+                states = request.get("states")
+                require(states is None or (isinstance(states, list) and all(isinstance(s, str) and s in ACTIVE | TERMINAL | {"queued"} for s in states)), "Invalid states filter")
+                cwd = request.get("cwd")
+                require(cwd is None or (isinstance(cwd, str) and Path(cwd).is_absolute()), "cwd filter must be absolute")
+                return [j for j in store.all() if (not states or j["state"] in states) and (cwd is None or j["spec"]["cwd"] == cwd)]
+            return self.snapshots.page(request, capture)
+        if operation == "status":
+            # No await or concurrent writer: health, resources, jobs come from one turn.
+            health = self.dispatch({"op": "health"})
+            return {"observed_at": time.time(), "health": health, "resources": self.scheduler.resources(),
+                    "jobs": [j for j in store.all() if j["state"] in ACTIVE | {"queued"}], "snapshot_consistent": True}
         if operation == "health":
             store.db.execute("SELECT 1").fetchone()
             jobs = store.all()
@@ -47,7 +97,7 @@ class API:
                     "accepting_jobs": error is None, "error": error,
                     "running_jobs": sum(j["state"] in ACTIVE for j in jobs),
                     "queued_jobs": sum(j["state"] == "queued" for j in jobs),
-                    "enforcement": self.capabilities}
+                    "enforcement": self.capabilities, **runtime_capabilities()}
         if operation == "resources":
             return self.scheduler.resources()
         if operation == "submit":
@@ -63,7 +113,8 @@ class API:
             self.scheduler.backend.ping()
             return self.scheduler.submit(request.get("request_id"), request.get("spec"), request.get("control_token"))
         if operation == "inspect":
-            return store.get(request.get("job_id"))
+            job = store.get(request.get("job_id"))
+            return {**job, "operator_actions": store.operator_actions(job["id"])}
         if operation == "cancel":
             return self.scheduler.cancel(request.get("job_id"), request.get("control_token"))
         if operation == "list":
@@ -82,7 +133,11 @@ class API:
             require(stream in {"stdout", "stderr"}, "stream must be stdout or stderr")
             offset = integer(request.get("offset", 0), 0, "offset")
             limit = integer(request.get("limit", 16384), 1, "limit")
-            require(limit <= 1024 * 1024, "Log limit must be <= 1 MiB")
+            require(limit <= MAX_LOG_BYTES, "Log limit must be <= 1 MiB")
+            tail = request.get("tail_bytes")
+            if tail is not None:
+                integer(tail, 1, "tail_bytes")
+                require(tail <= MAX_LOG_BYTES and offset == 0, "tail_bytes must be <= 1 MiB and cannot be combined with a nonzero offset")
             path = Path(job[f"{stream}_path"])
             try:
                 identity = None
@@ -96,6 +151,8 @@ class API:
                         raise RmgrError("LOG_UNAVAILABLE", f"Output is not a regular file: {path}")
                     if identity is not None and (info.st_dev, info.st_ino) != (identity["device"], identity["inode"]):
                         raise RmgrError("LOG_UNAVAILABLE", f"Output file was replaced: {path}")
+                    if tail is not None:
+                        offset = max(0, info.st_size - tail)
                     log.seek(offset)
                     data = log.read(limit)
                     more = bool(log.read(1))
@@ -116,13 +173,16 @@ async def connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
     try:
         peer = writer.get_extra_info("socket")
         _, uid, _ = struct.unpack("3i", peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-        require(uid == os.getuid(), "Only the daemon's user may connect")
         line = await asyncio.wait_for(reader.readline(), timeout=5)
         require(bool(line) and len(line) <= MAX_REQUEST, "Missing or oversized request")
         request = json.loads(line)
-        response = {"ok": True, "result": api.dispatch(request)}
+        require(isinstance(request, dict), "Request must be an object")
+        require(uid == os.getuid() or (uid == 0 and request.get("op") == "admin_cancel"), "Only the daemon user may connect; root may only perform operator cancellation")
+        response = {"ok": True, "result": api.dispatch(request, peer_uid=uid)}
     except RmgrError as exc:
-        response = {"ok": False, "error": {"code": exc.code, "message": str(exc)}}
+        response = {"ok": False, "error": exc.to_dict()}
+    except (OSError, sqlite3.Error) as exc:
+        response = {"ok": False, "error": {"code": "STORAGE_UNAVAILABLE", "message": str(exc)}}
     except (ValueError, TypeError, asyncio.TimeoutError) as exc:
         response = {"ok": False, "error": {"code": "INVALID_REQUEST", "message": str(exc)}}
     except Exception:
@@ -203,9 +263,15 @@ def request(home: Path, payload: dict, timeout: float = 10) -> dict:
             with client.makefile("rb") as response:
                 line = response.readline(32 * MAX_REQUEST)
         reply = json.loads(line)
+        if not isinstance(reply, dict) or type(reply.get("ok")) is not bool:
+            raise ValueError("Malformed daemon response")
+        if reply["ok"] and not isinstance(reply.get("result"), dict):
+            raise ValueError("Malformed daemon result")
+        if not reply["ok"] and (not isinstance(reply.get("error"), dict) or not all(isinstance(reply["error"].get(k), str) for k in ("code", "message"))):
+            raise ValueError("Malformed daemon error")
     except (OSError, ValueError) as exc:
         raise RmgrError("DAEMON_UNAVAILABLE", f"Cannot reach daemon: {exc}. Run rmgr service status / rmgr doctor") from exc
     if not reply.get("ok"):
         error = reply["error"]
-        raise RmgrError(error["code"], error["message"])
+        raise RmgrError(error["code"], error["message"], **{k: v for k, v in error.items() if k not in {"code", "message"}})
     return reply["result"]
