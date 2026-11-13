@@ -113,7 +113,7 @@ class ControlTests(unittest.TestCase):
         result = json.loads(output.getvalue())
         self.assertEqual(code, 0)
         self.assertEqual(result["id"], accepted[0]["id"])
-        self.assertEqual(result["control_token"], receipt["control_token"])
+        self.assertNotIn("control_token", result)
         self.assertEqual(len(self.store.all()), 1)
         self.assertEqual(receipt_path.read_bytes(), original_bytes)
         with patch("rmgr.cli.request", side_effect=lambda home, payload: self.api.dispatch(payload)), redirect_stdout(StringIO()):
