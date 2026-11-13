@@ -36,9 +36,11 @@ Pass a nondefault state directory before the command:
 
     rmgr --home /shared/private/rmgr-state health --json
 
-CLI result output goes to stdout. Data commands use indented JSON by default;
-there is no plain-text table mode for list. CLI/API exceptions are JSON on stderr;
-doctor and health print their diagnostic reports to stdout even when they exit 2.
+CLI result output goes to stdout. Existing data commands use indented JSON by
+default; list, inspect, resources, health, and logs also accept --text.
+The combined `status` view defaults to text and accepts --json.
+CLI/API exceptions are JSON on stderr; doctor, health, and status print their
+diagnostic reports to stdout even when they exit 2.
 Argument-parser usage errors are ordinary text. `--json` produces compact JSON
 for data commands. Do not parse human formatting or interpret an exit code of
 zero from `submit` as evidence that the experiment has finished.
@@ -49,10 +51,17 @@ Submitted program output is captured in files rather than streamed by submit.
 Use Runwarden (rmgr) for native experiments on this workstation. Read
 `rmgr manual ownership` and `rmgr manual limits` before submitting work;
 use `rmgr manual jobs` and command-specific `--help` for syntax and details.
+Use `rmgr describe --json` (or `describe COMMAND --json`) for machine-readable
+arguments, defaults, limits, output fields, and authorization requirements.
+Check health's protocol_version/features before using newer daemon features;
+the installed client version alone does not establish daemon capabilities.
 
 Use the shared daemon/state directory. Check `rmgr health --json` and
 `rmgr resources --json` before submission. Do not start a separate daemon to
 bypass a queue or run an experiment outside the manager when admission fails.
+When supported, use `rmgr validate JOB_OPTIONS -- PROGRAM ARGUMENTS` to check
+the effective spec/environment before submission; it creates no receipt or
+reservation and does not guarantee future launch.
 
 Submit the target command directly; no wrapper script is required:
 
@@ -69,8 +78,8 @@ overwritten. The manager keeps its own records centrally.
 
 A public job ID is NOT the secret control_token. List/inspect expose job IDs,
 not control keys. Submission generates a random key and saves it in your receipt
-before contacting the daemon. With --id-only the key stays out of terminal
-output; otherwise submit/retry also print it. The target program is not given
+before contacting the daemon. The 0.4 client keeps the key out of ordinary
+submit/retry output; only explicit --show-token prints it. The target program is not given
 the key. Read-only queries are shared; cancelling requires the matching key.
 
 Use a new receipt path for each new job. Keep receipts private, persistent, and
@@ -79,13 +88,22 @@ notes across conversation restarts; do not copy the keys into shared notes.
 The manager cannot remember those paths on an agent's behalf. A temporary
 directory that may be cleaned up is unsuitable for long-term recovery.
 
-After a lost submission response, use `rmgr retry --id-only --receipt PATH`.
+For read-only recovery, `rmgr lookup --receipt PATH --json` returns found/job
+without submitting or printing the key. After a lost submission response,
+use `rmgr retry --id-only --receipt PATH` to safely complete the same request.
 An already-accepted request returns its original job ID without executing again;
 if it was never accepted, retry submits the saved request. To cancel, use
 `rmgr cancel JOB_ID --receipt PATH`. Only cancel jobs you submitted or for which
 the user explicitly delegated authority and supplied the matching receipt.
 Do not search for/reuse another agent's receipts or bypass the API with direct
 process/service control. There is no job-editing API or lost-key recovery API.
+Do not use sudo or admin-cancel as an agent cancellation fallback. Only the
+human operator should use that separate privileged path.
+
+Use bounded waits and log reads: `rmgr logs JOB_ID --stream stderr --tail 4096
+--follow --timeout 20 --text` reads a bounded tail and follows for up to 20 seconds.
+Inspect/list JSON includes spec.cwd; `inspect JOB_ID --cwd-only` prints the
+execution directory, and `list --text --wide` includes directory columns.
 
 The --exclusive flag means running alone among managed jobs; it does not grant
 ownership or replace the control key. Keys prevent accidental API interference,
@@ -114,8 +132,9 @@ directory that other jobs will not modify:
       --timeout 600 --exclusive -- /path/to/python /path/to/benchmark.py --workers 8
 
 The CLI creates the receipt with mode 0600 before sending the request. The
-submission response contains the public job `id`, a private `control_token`,
-and the receipt path. Keep the receipt outside tracked/shared job artifacts.
+submission response contains the public job `id` and receipt path. The private
+control_token stays in that receipt unless --show-token is explicitly requested.
+Keep the receipt outside tracked/shared job artifacts.
 Receipt paths are never returned by job queries. Existing receipts are never
 overwritten: use retry to repeat a submission, or a new path for a new run.
 
@@ -187,8 +206,9 @@ resources to avoid starving the first ready job.
     }
 
 argv and cwd are required; stdout/stderr are optional (or null for defaults).
-With --spec, put job settings in JSON: command-line resource/cwd/environment/output
-options do not override the file. Receipt and request-id options still apply.
+With --spec, put job settings in JSON: explicitly supplied command-line job
+options are rejected, including options equal to defaults. Receipt and
+request-id options still apply.
 JSON executable/cwd paths must be absolute. CLI
 executable names are resolved by the submitting client. Defaults: 1 physical
 core, 1 GiB RAM, no GPU, nonexclusive, 3600 seconds, no dependencies or explicit
@@ -203,7 +223,82 @@ the intended environment's Python; no environment activation happens implicitly.
 The manager's Python environment need not match the experiment's environment.
 
 List pagination: `rmgr list --limit 100 --offset 0 --json`; follow next_offset
-until it is null. The maximum page size is 100. `--state` filters job state.
+until it is null. The maximum page size is 100. `--all` fetches every remaining
+match from --offset; --limit then controls the page size. --state filters job
+state and can be repeated to combine states before pagination. --active includes
+queued, starting, running, cancelling; --finished includes all terminal states.
+Choose only one of --state, --active, or --finished. Results are oldest first.
+
+Human-readable inspection (no jq or column required):
+
+    rmgr status
+    rmgr status --watch 2
+    rmgr list --text --active
+    rmgr list --text --finished --all
+    rmgr list --text --state running --state queued
+    rmgr list --text --wide
+    rmgr inspect JOB_ID --text
+    rmgr resources --text
+    rmgr health --text
+    rmgr logs JOB_ID --text
+    rmgr logs JOB_ID --stream stderr --text
+
+Tables show complete public IDs, states, requested CPUs/memory, runtime, exit
+code, command, and reason. --wide (text list/status) shows full commands and
+reasons. Jobs that never started show no runtime. Finished runtimes stop at
+completion. A list footer indicates remaining pages. Inspection shows the full
+command, timestamps, dependencies, allocation, current resource availability,
+and output paths; it does not interpret application stderr.
+
+Status combines health, resources, and every active/queued job. Memory numbers
+are reservations, not actual usage. These client-only views also work with a
+0.2 daemon and never read control receipts. With a 0.4 daemon, status is a
+consistent snapshot; list uses frozen snapshots across pages. With a legacy
+daemon, separate queries are used and marked best_effort_legacy; jobs can change
+between queries/pages. Current capacity is not historical usage of a finished job.
+List can filter exact execution directories with --cwd PATH. Continue frozen
+pages with --snapshot ID --offset NEXT_OFFSET. Snapshots expire after 120 seconds,
+on restart, or eviction from a 16-entry / 32-MiB-total cache. SNAPSHOT_EXPIRED
+requires a new listing; narrow filters on SNAPSHOT_TOO_LARGE. --all handles pages.
+Directory is the submitted execution cwd, not the caller's separately recorded
+shell directory or a running process's subsequent chdir.
+
+--watch takes a positive finite number of seconds between completed refreshes.
+Text watch redraws a terminal or appends snapshots when redirected. Ctrl+C
+returns 130. Degraded status continues refreshing; a connection error stops
+watch with code 2. One-shot degraded status returns 2.
+`status --json` returns observed_at, health, resources, and jobs;
+`status --json --watch 2` emits one compact JSON object per line.
+--text and --json cannot be combined. New metadata fields are additive; agents
+should tolerate extra fields. Control token output now requires --show-token.
+
+Logs --text prints only the requested chunk, without an extra newline; byte
+offset/limit still apply. Notices about more output or an unavailable file go
+to stderr. --tail BYTES starts at the last 1–1048576 bytes (requires log_tail in
+health features). --follow drains output with --timeout 30, --interval 1, and
+--max-bytes 1048576 defaults. It stops at terminal EOF, deadline, or byte budget.
+Follow JSON emits one object per chunk; follow --text emits only program output.
+Limit/deadline notices go to stderr and report the next offset. Successful log
+retrieval does not imply a successful job. UTF-8 splits still use replacement characters.
+
+`lookup --receipt PATH` reads only that receipt, returns found/request_id/job,
+and never submits. `validate` shares submit's job options and --spec, returning
+valid/spec/effective_environment/resources/warnings/reserved=false. It checks
+current paths and configuration, not future file availability or admission.
+It requires the validate daemon feature. `describe` is always offline.
+
+After an attempted submission, structured errors include acceptance and recovery:
+rejected/correct_request_use_new_receipt for definite request rejection, or
+unknown/retry_same_receipt when acceptance cannot be established. Do not edit
+receipts or create a new request to recover an uncertain outcome. Errors before
+receipt creation or before sending may lack those fields.
+
+Queue reason_details contains codes and relevant blocking_job_ids/resource
+amounts. Codes: CPU_RESERVATION, MEMORY_RESERVATION, GPU_RESERVATION,
+EXCLUSIVE_RUNNING, EXCLUSIVE_DRAIN, DEPENDENCIES, DEPENDENCY_FAILED, FIFO_BARRIER.
+Older records may have null details. Launch preparation failures are recorded
+as LAUNCH_PREPARATION_FAILED; storage uncertainty degrades admission while
+keeping durable reservations until reconciliation.
 
 Nonterminal states: queued, starting, running, cancelling.
 Terminal states: succeeded, failed, cancelled, timed_out, oom, blocked,
@@ -226,13 +321,15 @@ The CLI generates 32 random bytes, encodes them as a URL-safe string, and saves
 them in the private receipt before submission. The daemon stores only a SHA-256
 digest. A lost response cannot lose the original token because retry uses the
 receipt. The daemon never returns tokens/digests in list, inspect, wait, logs,
-health, or runner manifests. The CLI adds the token only to submit/retry output.
+health, or runner manifests. The CLI adds the token to submit/retry output only
+when explicitly requested with --show-token.
 
 Cancellation requires the matching token, even for an already completed job.
 Use `cancel JOB_ID --receipt PATH`. Alternatively, `--token-stdin` reads a raw
 token from stdin, keeping it out of process command-line arguments. A receipt
-for another job will not authorize cancellation. There is no tokenless --force
-option, job editing operation, or API for recovering a lost token.
+for another job will not authorize cancellation. There is no ordinary-user
+tokenless --force option, job editing operation, or API for recovering a lost token.
+The separate operator-only admin-cancel path requires a root socket peer.
 
 Only cancel work you submitted or for which control was explicitly delegated
 to you. Having a token demonstrates authority to the daemon, not a reason to
@@ -254,7 +351,7 @@ Do not stop/restart the shared daemon, alter its database, or call systemctl to
 bypass a denied cancellation. Service/configuration changes are operator tasks.
 
 Upgrading from 0.1 adds a nullable token-hash column without replacing job
-history. Old jobs have no token and cannot be cancelled through the new API.
+history. Old jobs have no token and cannot use ordinary token-authorized cancellation.
 Finish/cancel old jobs with 0.1 before upgrading. Legacy history remains readable;
 there is no automatic adoption or creation of credentials for somebody else's job.
 
@@ -301,6 +398,23 @@ the secret and adds it locally to its own submission output.
   real daemon recovery and GPU execution require separate host validation.
 
 ## operations
+
+After installing the 0.4 daemon at a planned maintenance window, an operator
+can cancel a job without its control token:
+
+    sudo /absolute/path/to/rmgr --home /home/srn/.local/state/rmgr \
+      admin-cancel JOB_ID --reason 'Stopped by the operator'
+
+Use a trusted installed executable and an explicit --home. UID 0 is checked from
+SO_PEERCRED, not request arguments or environment. This does not configure sudo
+or authorize agents to use sudo. Ordinary cancellation still requires the key.
+The daemon transactionally records the audit reason, timestamp, peer UID, and
+previous state before stopping a unit; inspect exposes operator_actions.
+Queued work becomes cancelled, active work becomes cancelling, and reservations
+remain until termination is observed. Already-terminal outcomes are preserved.
+Legacy jobs without tokens are supported. A running new daemon is required;
+there is no direct-database or systemctl fallback. The read-only preview refuses
+all cancellation, including admin-cancel.
 
 Ordinary agents should use health/resources and job commands. An operator
 installs the package, initializes configuration, runs doctor, and installs the

@@ -26,7 +26,7 @@ and preserving receipt paths in handoff notes. They are also available through
 `rmgr manual instructions`, so the installed package has one source of truth.
 
 The per-job `control_token` is generated automatically and required by the API
-for cancellation and submission retries. There is no API to edit a submitted
+for ordinary cancellation and submission retries. There is no API to edit a submitted
 job's command or resources. The `--exclusive` flag controls scheduling (running
 alone among managed jobs); it does not grant ownership or replace the key.
 Receipts protect against accidental API interference, not unrestricted access
@@ -188,7 +188,8 @@ accepts fields `argv`, `cwd`, `cores`, `memory_bytes`, `gpu`, `exclusive`,
 `timeout_seconds`, `after_success`, `env`, `stdout`, and `stderr`. In JSON, the executable and cwd
 must be absolute. Unknown fields and impossible requests are rejected.
 With `--spec`, put all job settings in the JSON file; command-line job options
-do not override it. `--receipt` and `--request-id` still apply to submission.
+are rejected if explicitly supplied alongside it. `--receipt` and `--request-id`
+still apply to submission.
 
 The CLI saves a private receipt before sending the request. After a lost
 response, run `rmgr retry --receipt ./job.receipt.json`; the same request ID,
@@ -241,21 +242,25 @@ it to enable 0.3 behavior. Do not replace package files while a launcher starts.
 
 ## Job control tokens
 
-Submission returns a public `id`, a private `control_token`, and the receipt
-path. Cancellation requires that token, supplied through `--receipt PATH` or
+Submission returns a public `id` and the receipt path. Starting with the 0.4
+client, the private `control_token` stays in the receipt unless `--show-token`
+is explicitly requested on submit/retry. Ordinary cancellation requires that token, supplied through `--receipt PATH` or
 `--token-stdin`. Tokens are never included in public queries or job manifests;
 the daemon stores only their hashes. Read-only queries remain shared.
 
 Keep receipts private and out of source control. They are created with mode
 0600 and are never found/reused automatically on another agent's behalf. The
 receipt is the recovery path after a lost response or conversation restart.
-There is no tokenless force-cancel option or API for recovering a lost key.
+There is no ordinary-user tokenless force-cancel or lost-key recovery API.
+The 0.4 daemon adds a separate root-authorized `admin-cancel` operation with an
+audit reason; see the operator section below.
 This guards against accidental API interference, not unrestricted same-user
 filesystem access or direct process/service control. See `rmgr manual ownership`.
 
 Version 0.2 adds a token-hash column while preserving old history. Finish/cancel
 0.1 jobs before upgrading: legacy jobs have no token and cannot be cancelled
-through the new API. They remain readable and are not silently claimed.
+through ordinary token-authorized cancellation. They remain readable and are
+not silently claimed; the 0.4 operator path can cancel them explicitly.
 
 ## Dependencies
 
@@ -302,9 +307,186 @@ a cursor can be replaced in the displayed text; the stored log bytes remain
 unchanged. Disk log retention is manual in this first version. Input files and
 executables are not snapshotted: preserve an experiment's checkout/deck until it
 finishes. History stores the submitted command and environment, not automatic
-source revision discovery. Data commands return indented JSON by default;
-`--json` makes it compact. `instructions`, `manual`, help, `service render`, and submission with
-`--id-only` have plain-text output; there is no table mode for `list`.
+source revision discovery. Existing data commands return indented JSON by default;
+`--json` makes it compact. `instructions`, `manual`, help, `service render`, and
+submission with `--id-only` have plain-text output. Human-readable monitoring
+commands are described below.
+
+## Human-readable monitoring
+
+```bash
+rmgr status                           # Capacity, readiness, and all active/queued jobs
+rmgr status --watch 2                  # Refresh until Ctrl+C
+rmgr list --text --active              # Queued, starting, running, cancelling
+rmgr list --text --finished            # All terminal states, including blocked/interrupted
+rmgr list --text --state running --state queued
+rmgr list --text --finished --all --wide
+rmgr inspect JOB_ID --text             # Details, current capacity, and output paths
+rmgr resources --text
+rmgr health --text
+rmgr logs JOB_ID --text
+rmgr logs JOB_ID --stream stderr --text
+```
+
+`status` defaults to text; `--json` returns an object with `observed_at`, `health`,
+`resources`, and `jobs`. Other commands keep their existing JSON defaults and
+accept `--text` explicitly. `--json` and `--text` cannot be combined.
+These views need no external formatting tools and work with a 0.2 daemon.
+They query only public job information; they do not read receipts or control tokens.
+
+Memory figures are **reservations, not measured RAM usage**. Tables show full
+job IDs, requested CPUs/memory, execution runtime, exit code, command, and reason.
+Jobs that never started have no runtime; finished runtimes stop at the end time.
+Use `--wide` on text `list` or `status` to show complete command lines, reasons,
+and execution directories. `inspect JOB_ID --cwd-only` prints the directory alone;
+JSON inspect/list already include it as `spec.cwd`. `list --cwd PATH` selects
+jobs from that exact directory. This is the configured execution directory, not
+a separately recorded shell invocation directory or the process's current cwd.
+`inspect --text` shows the full command and recorded reason; it does not interpret
+application stderr. Its available resources are current, not historical.
+
+`list` defaults to 100 rows, oldest first; the footer reports additional pages.
+`--all` fetches every remaining match from `--offset`. `--limit` remains a page
+size of 1–100. Repeated `--state` values are combined before applying the offset
+and limit. Choose only one of `--state`, `--active`, or `--finished`.
+`status` includes every active/queued job, across pages.
+With a 0.4 daemon, status is a consistent snapshot and list pages use an immutable
+snapshot. Continue a page with `--snapshot ID --offset NEXT_OFFSET`, or let
+`--all` do it. Snapshots expire after 120 seconds, on daemon restart, or when
+evicted from the bounded cache (16 snapshots / 32 MiB total). Expired snapshots
+return `SNAPSHOT_EXPIRED`; start a new listing explicitly. Narrow the state/cwd
+filters if one snapshot exceeds 32 MiB. Legacy daemons use separate live queries
+and report `consistency: best_effort_legacy`; jobs may change between pages.
+
+`--watch` takes a positive finite interval in seconds, measured between completed
+refreshes. Text watch redraws a terminal, or appends snapshots when redirected;
+`--json --watch 2` emits one JSON object per line. Ctrl+C exits with code 130.
+Degraded health is displayed and retried during watch; connection errors stop
+monitoring with exit code 2. A one-shot degraded `status` also returns 2.
+
+`logs --text` writes the selected chunk directly to stdout without adding a
+newline. Offset/limit remain byte-based. More-output and missing-file notices
+go to stderr, as do CLI/API errors (still JSON). Use `--tail 4096` to start at
+the last 4096 **bytes** (requires a 0.4 daemon). `--follow` polls until a terminal
+job's remaining output is read, a deadline expires, or its byte budget is reached.
+Defaults are `--timeout 30 --interval 1 --max-bytes 1048576`. Follow output is
+raw text with `--text`, otherwise one JSON chunk per line. Completion of a log
+read is not evidence of job success; use `wait` or `inspect` for that.
+
+### Try the development client without installing it
+
+From this checkout, use its Python module instead of the installed executable:
+
+```bash
+cd /home/srn/Documents/code/slurm_like_resource_manager
+python3 -m rmgr.cli status
+python3 -m rmgr.cli status --watch 2
+python3 -m rmgr.cli list --text --finished --all
+python3 -m rmgr.cli inspect JOB_ID --text
+```
+
+Use Python 3.11 or newer. These commands read the existing daemon and do not
+install the package, restart the service, or submit/cancel jobs. For a nondefault
+state directory, put `--home PATH` before the command. Tests requiring no live
+daemon are available with `python3 -m unittest tests.test_views -v`.
+
+To use the development client from any worktree **without changing its cwd**:
+
+```bash
+rmgr-dev() { /home/srn/Documents/code/slurm_like_resource_manager/scripts/rmgr-dev "$@"; }
+rmgr-dev describe submit --json
+rmgr-dev list --text --active --wide
+rmgr-dev inspect JOB_ID --cwd-only
+```
+
+This replaces the earlier convenience function that changed into the repository.
+The launcher preserves the caller's cwd, so default execution/output directories
+remain in the worktree where you invoke it. It does not install anything or start
+a daemon. Like the installed CLI, actual submit/cancel commands still change jobs;
+use only read commands against production while evaluating the new version.
+
+For new daemon-side features without upgrading production, start the **synthetic,
+read-only preview** from the checkout in one terminal:
+
+```bash
+python3 -m rmgr.preview
+```
+
+It prints commands containing its temporary `--home`. Run those in another
+terminal from this checkout. You can also use that home for `validate`,
+`list --all --text --wide`, and `inspect`. The preview has three synthetic jobs,
+sample output files, and private sample receipts. It never calls systemd or
+executes workloads, rejects submissions/cancellations, and removes temporary
+state on Ctrl+C. Do not use its resource numbers as host measurements.
+
+## Agent discovery and recovery (0.4 development)
+
+```bash
+rmgr describe --json                   # Offline command catalog and contracts
+rmgr describe submit --json            # One command, including its arguments
+rmgr health --json                     # Actual daemon protocol_version/features
+rmgr validate --cores 8 --memory 16G -- /path/to/python -m fe_solver solve ...
+rmgr lookup --receipt ./run.receipt.json --json
+rmgr logs JOB_ID --stream stderr --tail 4096 --follow --timeout 20 --text
+```
+
+`describe` is generated from CLI argument definitions and JobSpec fields. It
+reports authorization, output-field names, defaults, limits, states, and exit
+codes. `instructions` remains the concise agent entry point. Client version is
+not a guarantee of daemon features: inspect health's `protocol_version` and
+`features`; their absence means legacy/unknown. Validation, tail, snapshots,
+structured queue details, and operator cancellation require the new daemon.
+
+`validate` checks the resolved specification, executable, dependencies, and output
+paths against current configured capacity. It reports the effective environment
+and warnings but writes no receipt, reserves nothing, and cannot guarantee
+future launch. `lookup` reads only the explicitly supplied receipt and finds its
+request ID without submitting or exposing its token; `found: false` means no
+accepted job was found. It also works with older daemons by searching public history.
+
+Submission errors now include `acceptance`, `recovery`, `request_id`, and `receipt`
+when a receipt has been saved and submission attempted. A definite rejection
+instructs the caller to correct the request and use a new receipt. An uncertain
+outcome requires retrying the same receipt; never create a second job to recover
+an uncertain submission. Local errors before submission may lack these fields.
+Existing accepted retries still return the original job, even if it failed.
+
+Queued jobs expose `reason_details` with a stable code and relevant blocking IDs
+or requested/available resource amounts. Codes include `CPU_RESERVATION`,
+`MEMORY_RESERVATION`, `GPU_RESERVATION`, `EXCLUSIVE_RUNNING`, `EXCLUSIVE_DRAIN`,
+`DEPENDENCIES`, `DEPENDENCY_FAILED`, and `FIFO_BARRIER`. Older jobs may have null
+details until their next scheduling decision. Existing JSON fields remain;
+new metadata is additive, except that printing a control token is now opt-in.
+
+## Operator cancellation without a job key
+
+After a planned upgrade to the new daemon, an operator can run:
+
+```bash
+sudo /absolute/path/to/rmgr --home /home/srn/.local/state/rmgr \
+  admin-cancel JOB_ID --reason 'Stopped by the operator'
+```
+
+Use the executable from a trusted installation and the explicit target state
+directory. This is a privileged operator command, not an agent workaround for
+a denied cancellation. The daemon verifies UID 0 from Unix-socket peer credentials;
+request JSON and environment variables cannot grant that authority. Nothing is
+added to sudoers, and no automatic sudo invocation is performed.
+
+The daemon commits an audit entry and cancellation intent before stopping the
+unit. Queued jobs are cancelled immediately; running jobs enter `cancelling`
+and retain reservations until their processes stop. It uses the same systemd
+process-tree termination path as normal cancellation. Completed jobs keep their
+outcome. `inspect` exposes `operator_actions` with time, peer UID, reason, and
+previous state. It can also cancel legacy jobs that have no token. A daemon
+connection is required; it does not edit SQLite or kill processes behind a stopped
+daemon. The receipt rules for ordinary agents remain unchanged.
+
+This development checkout has not been installed into the shared service.
+Test the operator path without sudo or real jobs using
+`python3 -m unittest tests.test_agent_tools -v`. Peer authorization and backend
+stop requests are simulated there; actual privileged termination is not claimed
+as host-validated by those tests.
 
 ## Development and boundaries
 
