@@ -19,7 +19,7 @@ Start here:
     rmgr manual limits
 
 This manual works offline without a daemon. Topics are overview, instructions, jobs,
-ownership, limits, and operations. Use `rmgr manual TOPIC` for a short section,
+ownership, limits, host-setup, and operations. Use `rmgr manual TOPIC` for a short section,
 `rmgr manual all` for the complete guide, or add `--json` for a text envelope
 with version and topic information. No pager or interactive prompts are used.
 `rmgr instructions` prints the instructions topic directly to stdout as readable
@@ -45,6 +45,97 @@ Argument-parser usage errors are ordinary text. `--json` produces compact JSON
 for data commands. Do not parse human formatting or interpret an exit code of
 zero from `submit` as evidence that the experiment has finished.
 Submitted program output is captured in files rather than streamed by submit.
+
+## host-setup
+
+Requires Python 3.11+, Linux with cgroup v2, and systemd 254+.
+Run these steps in a normal host terminal. Check user-manager delegation:
+
+    systemctl show "user@$(id -u).service" -p Delegate -p DelegateControllers
+
+The cpu and cpuset controllers are separate; cpu alone does not allow enforced
+core assignments.
+
+If cpuset or memory is missing, edit the account-specific override:
+
+    sudo systemctl edit "user@$(id -u).service"
+
+Add these lines above the editor's discard line, then save:
+
+    [Service]
+    Delegate=cpu cpuset memory pids
+
+Before rebooting an existing installation, pause agent submissions and finish
+or cancel all queued/running jobs. Then run `rmgr service stop`.
+Stopping the scheduler alone does not stop job units.
+Save your work, then reboot the whole PC:
+
+    sudo reboot
+
+Restarting only rmgr.service does not apply this change. If already installed,
+stop the service again after login with `rmgr service stop` before running
+doctor: it may have started at boot.
+
+On fresh Ubuntu 24.04, install missing packaging tools with
+`sudo apt-get install pipx python3-venv`. Set up the pipx executable directory:
+
+    pipx ensurepath &&
+    export PATH="${PIPX_BIN_DIR:-$HOME/.local/bin}:$PATH"
+
+ensurepath configures future shells; the export updates this shell too.
+For a first installation, run from the checkout:
+
+    pipx install . &&
+    rmgr init &&
+    rmgr doctor &&
+    rmgr service install &&
+    rmgr health --wait 30 --json
+
+To upgrade an older pipx installation to this checkout, pause agent submissions,
+finish/cancel managed jobs, stop the service, and back up state and receipts.
+With the PATH setup above in place, run:
+
+    rmgr service stop &&
+    pipx install --force . &&
+    rmgr init &&
+    rmgr doctor &&
+    rmgr service install &&
+    rmgr health --wait 30 --json
+
+Alternatively, for a first virtualenv installation:
+
+    python3 -m venv .venv && .venv/bin/python -m pip install . &&
+    .venv/bin/rmgr init &&
+    .venv/bin/rmgr doctor &&
+    .venv/bin/rmgr service install &&
+    .venv/bin/rmgr health --wait 30 --json
+
+For a virtualenv upgrade, stop its service after draining jobs, then run
+`.venv/bin/python -m pip install --upgrade .` followed by the init/doctor/service
+install/health commands above. Keep the environment at its original path:
+the service records its interpreter's absolute path.
+
+For host repair with this version already installed, skip only package
+installation and run init/doctor/service install/health with the service stopped
+and no managed jobs active. An older client must be upgraded to get host-setup
+and health --wait; changing delegation alone does not add those commands.
+
+init only creates configuration. If doctor fails, fix the host before continuing.
+health --wait retries startup failures and degraded health for up to the given
+seconds, printing only the final result. Success exits 0; timeout exits 2 with
+the last error or degraded report. No new request starts after the deadline.
+Without --wait, health checks once.
+If startup fails, inspect `rmgr service status` and
+`journalctl --user -u rmgr.service -b -n 50 --no-pager`.
+
+For service startup at boot and persistence after logout, an operator can run
+`loginctl enable-linger "$USER"`. This may require administrator authorization;
+it is optional for jobs run while logged in.
+
+A bus connection failure can mean a restricted sandbox or no user session;
+check `systemctl --user status` in a normal terminal first. A missing
+memory.swap.max requires checking kernel cgroup v2 swap accounting support.
+Runwarden never applies host changes automatically. GPU hardware is not checked.
 
 ## instructions
 
@@ -420,11 +511,8 @@ Ordinary agents should use health/resources and job commands. An operator
 installs the package, initializes configuration, runs doctor, and installs the
 service. Do not repair a shared service during another agent's experiment.
 
-    pipx install /path/to/checkout
-    rmgr init
-    rmgr doctor
-    rmgr service install
-    rmgr health --json
+Follow `rmgr manual host-setup` for prerequisites, PATH setup, installation,
+upgrades, and host repair. It includes the commands for pipx and virtualenvs.
 
 The default daemon state directory is $XDG_STATE_HOME/rmgr, or
 ~/.local/state/rmgr. It must be owned by the user with mode 0700. The socket
@@ -483,23 +571,4 @@ sudo automatically. Stop the scheduler before package upgrades and preserve
 its state and private receipts. Live validation instructions are in the project
 README/docs; runtime capabilities must be checked on the actual host.
 
-Host setup for a missing cpuset or memory controller:
-
-    systemctl show "user@$(id -u).service" -p Delegate -p DelegateControllers
-
-The cpu and cpuset controllers are separate. A user manager with only
-`cpu memory pids` delegated cannot enforce CPU core assignments; its jobs lack
-`cpuset.cpus.effective`. An administrator can add an account-specific override:
-
-    sudo systemctl edit "user@$(id -u).service"
-
-Enter these two lines in the override:
-
-    [Service]
-    Delegate=cpu cpuset memory pids
-
-Apply at a planned reboot or full logout/login that restarts the user manager,
-then rerun `rmgr doctor`. Lingering or other open sessions may keep the manager
-alive after logout. Restarting it during work can terminate the desktop and
-user services. A missing `memory.swap.max` instead requires checking kernel
-cgroup v2 swap accounting support. The tool never applies these changes itself.
+For host setup and missing-controller recovery, run `rmgr manual host-setup`.

@@ -49,7 +49,7 @@ def read_limit(cgroup: Path, filename: str) -> str:
                 f"An administrator may need to run: sudo systemctl edit {unit}, "
                 "and add [Service] with Delegate=cpu cpuset memory pids. "
                 "Apply at a planned reboot or full user-manager restart, then rerun rmgr doctor. "
-                "See rmgr manual for host setup."
+                "Run rmgr manual host-setup for the steps."
             )
         raise RuntimeError(message) from exc
 

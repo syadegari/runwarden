@@ -55,7 +55,7 @@ def describe(parser, topic=None):
         "resources": ["physical_cores", "cpu_ids", "available_cpu_ids", "memory_bytes", "available_memory_bytes", "gpu_count", "gpu_available", "exclusive_running"],
         "manual": ["version", "topic", "topics", "text"],
         "instructions": ["version", "topic", "topics", "text"],
-        "doctor": ["config", "state_directory", "status", "enforcement", "error"],
+        "doctor": ["config", "state_directory", "status", "enforcement", "error", "hint"],
         "init": ["config", "resources"],
         "daemon": ["stopped"],
         "service": ["unit (render)", "installed/message (install)", "systemd properties (status)", "action/ok (start/stop/restart)"],

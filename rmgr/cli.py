@@ -65,7 +65,8 @@ def parser() -> argparse.ArgumentParser:
     for name in ("status", "list"):
         parsers[name].add_argument("--wide", action="store_true", help="Show full command lines and reasons in text output")
     parsers["status"].add_argument("--watch", type=float, metavar="SECONDS", help="Refresh repeatedly; Ctrl+C stops monitoring")
-    parsers["manual"].add_argument("topic", nargs="?", default="overview", help="overview, instructions, jobs, ownership, limits, operations, or all")
+    parsers["health"].add_argument("--wait", type=float, metavar="SECONDS", help="Wait for readiness, printing only the final result")
+    parsers["manual"].add_argument("topic", nargs="?", default="overview", help="overview, host-setup, instructions, jobs, ownership, limits, operations, or all")
     parsers["service"].add_argument("action", choices=["render", "install", "status", "start", "stop", "restart"])
     parsers["describe"].add_argument("topic", nargs="?", help="Optional command to describe")
     job_arguments(parsers["validate"])
@@ -224,6 +225,27 @@ def execute(args) -> tuple[dict, int]:
         return manual("instructions"), 0
     if name == "manual":
         return manual(args.topic), 0
+    if name == "health" and args.wait is not None:
+        deadline = time.monotonic() + args.wait
+        result = None
+        error = RmgrError("DAEMON_UNAVAILABLE", "Readiness deadline expired before a health response")
+        while (remaining := deadline - time.monotonic()) > 0:
+            try:
+                result = request(home, {"op": "health"}, timeout=min(10, remaining))
+                error = None
+                if result["status"] == "ready":
+                    return result, 0
+            except RmgrError as exc:
+                if exc.code != "DAEMON_UNAVAILABLE":
+                    raise
+                error = exc
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.5, remaining))
+        if error is not None:
+            raise error
+        return result, 2
     if name == "list":
         states = (ACTIVE | {"queued"} if args.active else TERMINAL if args.finished else args.state)
         return list_jobs(home, states, offset=args.offset, limit=args.limit, all_pages=args.all,
@@ -307,6 +329,8 @@ def execute(args) -> tuple[dict, int]:
             return result, 0
         except RmgrError as exc:
             result.update(status="unavailable", error={"code": exc.code, "message": str(exc)})
+            if exc.code in {"ENFORCEMENT_UNAVAILABLE", "BACKEND_UNAVAILABLE", "LAUNCH_ERROR"}:
+                result["hint"] = "Host setup help: rmgr manual host-setup. Fix the host, then rerun rmgr doctor before starting the service."
             return result, 2
     if name in {"submit", "retry"}:
         path = args.receipt.expanduser().absolute()
@@ -374,6 +398,8 @@ def main(argv=None) -> int:
     watch = getattr(args, "watch", None)
     if watch is not None and (not math.isfinite(watch) or watch <= 0):
         cli.error("--watch must be finite and positive")
+    if args.command == "health" and args.wait is not None and (not math.isfinite(args.wait) or args.wait <= 0):
+        cli.error("--wait must be finite and positive")
     if getattr(args, "cwd_only", False) and args.json:
         cli.error("--cwd-only and --json cannot be combined")
     if getattr(args, "show_token", False) and args.id_only:

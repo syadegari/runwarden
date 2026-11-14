@@ -207,7 +207,7 @@ class ManualTests(unittest.TestCase):
             self.assertEqual(main(["manual", "all", "--json"]), 0)
         network.assert_not_called()
         result = json.loads(output.getvalue())
-        for topic in ("overview", "instructions", "jobs", "ownership", "limits", "operations"):
+        for topic in ("overview", "host-setup", "instructions", "jobs", "ownership", "limits", "operations"):
             self.assertIn(topic, result["topics"])
         self.assertIn("same Linux account", result["text"])
         self.assertIn("rmgr retry", result["text"])

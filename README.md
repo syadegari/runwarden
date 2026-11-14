@@ -36,32 +36,108 @@ The bundled manual works offline, includes examples and failure handling, and
 supports topics or `rmgr manual all --json`. Command-specific `--help` supplies
 exact syntax. No plugin, network lookup, or running daemon is needed to read it.
 
+## Host setup
+
+Before installing, check that your user manager delegates CPU and memory controls:
+
+```bash
+systemctl show "user@$(id -u).service" -p Delegate -p DelegateControllers
+```
+
+Run this from a normal host terminal. If the user bus is unavailable, first
+check `systemctl --user status`; a restricted sandbox or missing login session
+does not establish a delegation problem. The `cpu` and `cpuset` controllers are
+separate: having `cpu` alone does not allow enforced core assignments.
+
+If `cpuset` or `memory` is missing, run `sudo systemctl edit "user@$(id -u).service"`
+and add this above the editor's discard line:
+
+```ini
+[Service]
+Delegate=cpu cpuset memory pids
+```
+
+Before rebooting an existing installation, pause submissions from agents and
+finish or cancel all queued/running jobs. Stop the scheduler with `rmgr service stop`
+after draining the queue; stopping it alone does not stop job units.
+Save your work, then reboot the whole PC with `sudo reboot`. Restarting only
+`rmgr.service` does not apply this change. After login, stop an existing service
+again with `rmgr service stop` before running `doctor`: it may have started at boot.
+The same instructions are available offline after installation: `rmgr manual host-setup`.
+
 ## Install
 
 Requires Python 3.11+, Linux with cgroup v2, and systemd 254+ (Ubuntu 24.04
-has systemd 255). There are no Python runtime dependencies. Run from this checkout:
+has systemd 255). There are no Python runtime dependencies. On a fresh Ubuntu
+24.04 system, install the packaging tools with
+`sudo apt-get install pipx python3-venv` if they are missing.
+
+Set up pipx's executable directory before invoking `rmgr`:
 
 ```bash
-pipx install .
-rmgr init
-rmgr doctor
-rmgr service install
-rmgr health --json
+pipx ensurepath &&
+export PATH="${PIPX_BIN_DIR:-$HOME/.local/bin}:$PATH"
 ```
+
+`ensurepath` configures future shells; the export also updates this shell.
+For a first installation, run from this checkout:
+
+```bash
+pipx install . &&
+rmgr init &&
+rmgr doctor &&
+rmgr service install &&
+rmgr health --wait 30 --json
+```
+
+For an existing installation, see [upgrade or repair](#upgrade-or-repair) below.
+
+`init` only creates configuration; `doctor` verifies actual enforcement. If it
+fails, follow its hint or run `rmgr manual host-setup` before continuing.
+`health --wait 30` waits for startup and prints only the final result; a real
+failure still exits nonzero. Check `rmgr service status` if it times out.
 
 If pipx is unavailable, an isolated virtual environment works too:
 
 ```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install .
-.venv/bin/rmgr init
-.venv/bin/rmgr doctor
-.venv/bin/rmgr service install
+python3 -m venv .venv && .venv/bin/python -m pip install . &&
+.venv/bin/rmgr init &&
+.venv/bin/rmgr doctor &&
+.venv/bin/rmgr service install &&
+.venv/bin/rmgr health --wait 30 --json
 ```
 
 Keep that virtual environment in place: the service records its interpreter's
 absolute path. Neither installation method modifies the `py3.14` environment.
 The manager's Python and a job's Python can be different versions/environments.
+
+### Upgrade or repair
+
+To upgrade to this checkout, pause agent submissions, finish/cancel managed jobs,
+and stop the existing service before replacing package files. Back up the state
+directory and retain private receipts. With the pipx PATH setup above in place:
+
+```bash
+rmgr service stop &&
+pipx install --force . &&
+rmgr init &&
+rmgr doctor &&
+rmgr service install &&
+rmgr health --wait 30 --json
+```
+
+For a virtualenv installation, use its `.venv/bin/rmgr` commands and replace
+the pipx command with `.venv/bin/python -m pip install --upgrade .`.
+Keep the environment at its original path. Installing the service after stopping
+it ensures the daemon starts with the updated package.
+
+For host repair with this version already installed, skip only the package
+installation step, then run `init`, `doctor`, `service install`, and
+`health --wait 30 --json` with the service stopped and no managed jobs active.
+An older client must be upgraded to get `manual host-setup` and `health --wait`;
+changing delegation alone does not add those commands.
+
+### State and service
 
 `init` writes configuration only if absent. Its default directory is
 `$XDG_STATE_HOME/rmgr`, or `~/.local/state/rmgr`. The directory must be private

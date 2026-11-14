@@ -111,6 +111,107 @@ class InterfaceTests(unittest.TestCase):
                 expected = "one managed GPU job" if gpu_count else "set gpu_count=1"
                 self.assertIn(expected, report["gpu_note"])
 
+    def test_health_wait_prints_only_final_readiness(self):
+        ready = {"status": "ready", "accepting_jobs": True}
+        responses = [RmgrError("DAEMON_UNAVAILABLE", "starting"), {"status": "degraded"}, ready]
+        with patch("rmgr.cli.request", side_effect=responses) as request, \
+             patch("rmgr.cli.time.sleep"), redirect_stdout(StringIO()) as output, \
+             redirect_stderr(StringIO()) as errors:
+            self.assertEqual(main(["--home", str(self.home), "health", "--wait", "30", "--json"]), 0)
+        self.assertEqual(json.loads(output.getvalue()), ready)
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(request.call_count, 3)
+        for call in request.call_args_list:
+            self.assertEqual(call.args, (self.home, {"op": "health"}))
+            self.assertGreater(call.kwargs["timeout"], 0)
+            self.assertLessEqual(call.kwargs["timeout"], 10)
+
+    def test_health_wait_deadline_keeps_last_failure(self):
+        for response in (RmgrError("DAEMON_UNAVAILABLE", "still offline"), {"status": "degraded"}):
+            with self.subTest(response=response):
+                now = [0.0]
+                def advance(seconds):
+                    now[0] += seconds
+                kwargs = {"side_effect": response} if isinstance(response, Exception) else {"return_value": response}
+                with patch("rmgr.cli.request", **kwargs), \
+                     patch("rmgr.cli.time.monotonic", side_effect=lambda: now[0]), \
+                     patch("rmgr.cli.time.sleep", side_effect=advance), \
+                     redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors:
+                    self.assertEqual(main(["health", "--wait", "1", "--json"]), 2)
+                self.assertEqual(now[0], 1)
+                if isinstance(response, Exception):
+                    self.assertEqual(output.getvalue(), "")
+                    self.assertEqual(json.loads(errors.getvalue())["error"]["message"], "still offline")
+                else:
+                    self.assertEqual(json.loads(output.getvalue()), response)
+                    self.assertEqual(errors.getvalue(), "")
+
+    def test_health_wait_does_not_replace_diagnostics_with_a_deadline_request(self):
+        degraded = {"status": "degraded", "error": {"code": "BACKEND_UNAVAILABLE", "message": "missing cpuset"}}
+        for oversleep in (0, 0.1):
+            with self.subTest(oversleep=oversleep):
+                now = [0.0]
+                starts = []
+
+                def request(home, payload, *, timeout):
+                    starts.append(now[0])
+                    self.assertLessEqual(timeout, 1 - now[0])
+                    now[0] += min(0.01, timeout)
+                    if timeout < 0.01:
+                        raise RmgrError("DAEMON_UNAVAILABLE", "socket timed out")
+                    return degraded
+
+                def sleep(seconds):
+                    now[0] += seconds + oversleep
+
+                with patch("rmgr.cli.request", side_effect=request), \
+                     patch("rmgr.cli.time.monotonic", side_effect=lambda: now[0]), \
+                     patch("rmgr.cli.time.sleep", side_effect=sleep), \
+                     redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors:
+                    self.assertEqual(main(["health", "--wait", "1", "--json"]), 2)
+                self.assertEqual(json.loads(output.getvalue()), degraded)
+                self.assertEqual(errors.getvalue(), "")
+                self.assertEqual(len(starts), 2)
+                self.assertTrue(all(start < 1 for start in starts))
+
+    def test_health_wait_handles_expiry_before_first_request(self):
+        with patch("rmgr.cli.time.monotonic", side_effect=[0, 1]), \
+             patch("rmgr.cli.request") as request, redirect_stderr(StringIO()) as errors:
+            self.assertEqual(main(["health", "--wait", "0.001", "--json"]), 2)
+        request.assert_not_called()
+        self.assertEqual(json.loads(errors.getvalue())["error"]["code"], "DAEMON_UNAVAILABLE")
+
+    def test_health_wait_does_not_retry_unrelated_errors_or_change_one_shot(self):
+        for argv, error in ((["health", "--wait", "30"], RmgrError("FORBIDDEN", "denied")),
+                            (["health"], RmgrError("DAEMON_UNAVAILABLE", "offline"))):
+            with self.subTest(argv=argv), patch("rmgr.cli.request", side_effect=error) as request, \
+                 patch("rmgr.cli.time.sleep") as sleep, redirect_stderr(StringIO()):
+                self.assertEqual(main(argv), 2)
+                request.assert_called_once()
+                sleep.assert_not_called()
+
+    def test_health_wait_rejects_invalid_durations(self):
+        for duration in ("0", "-1", "nan", "inf"):
+            with self.subTest(duration=duration), redirect_stderr(StringIO()), \
+                 patch("rmgr.cli.request") as request, self.assertRaises(SystemExit) as error:
+                main(["health", "--wait", duration])
+            self.assertEqual(error.exception.code, 2)
+            request.assert_not_called()
+
+    def test_doctor_failure_points_to_offline_host_setup(self):
+        (self.home / "config.json").write_text(json.dumps({"cpu_ids": [0], "memory_bytes": GIB, "gpu_count": 0}))
+        with patch.object(SystemdBackend, "check", side_effect=RmgrError("ENFORCEMENT_UNAVAILABLE", "missing cpuset")), \
+             redirect_stdout(StringIO()) as output:
+            self.assertEqual(main(["--home", str(self.home), "doctor", "--json"]), 2)
+        report = json.loads(output.getvalue())
+        self.assertEqual(report["error"]["code"], "ENFORCEMENT_UNAVAILABLE")
+        self.assertIn("rmgr manual host-setup", report["hint"])
+        with patch("rmgr.cli.request") as request, redirect_stdout(StringIO()) as guide:
+            self.assertEqual(main(["manual", "host-setup"]), 0)
+        request.assert_not_called()
+        self.assertIn("Delegate=cpu cpuset memory pids", guide.getvalue())
+        self.assertIn("rmgr health --wait 30 --json", guide.getvalue())
+
     def test_list_pagination(self):
         self.submit()
         for number in range(3):
