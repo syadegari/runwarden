@@ -1,7 +1,13 @@
 # GPU simulations and 16-thread FE benchmarks
 
-The commands and helper below target Runwarden 0.3. Upgrade the installed package
-and restart the daemon before using --stdout/--stderr.
+These examples use the 0.4 development client. Output-path options require a
+0.3 or newer daemon; log tail requires a 0.4 daemon. Check `rmgr health --json`
+for actual capabilities. See [upgrade guidance](host-setup.md#upgrade-or-repair).
+
+- [Minimal scheduling check](#minimal-scheduling-check)
+- [Two native FE jobs](#two-native-fe-jobs)
+- [Two GPU jobs](#two-gpu-jobs)
+- [Monitor and read logs](#monitor-and-read-logs)
 
 The resource counts below are illustrative workload settings, not specifications
 of the development machine. Adjust core requests and worker counts together to
@@ -122,9 +128,10 @@ The FE jobs above are the more representative native interoperability check.
 Use the printed IDs, or recover them from the run directory's `jobs.json`.
 
 ```bash
-watch -n 1 'rmgr list'
-rmgr inspect JOB_ID
-rmgr resources
+rmgr status --watch 2
+rmgr list --text --active
+rmgr inspect JOB_ID --text
+rmgr resources --text
 rmgr wait JOB_ID --timeout 180
 ```
 
@@ -135,12 +142,21 @@ finishes unsuccessfully. Its deadline does not cancel the job. Use `htop`
 Logs remain available after completion:
 
 ```bash
-rmgr logs JOB_ID --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["text"], end="")'
-rmgr logs JOB_ID --stream stderr --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["text"], end="")'
+rmgr logs JOB_ID --text
+rmgr logs JOB_ID --stream stderr --text
 ```
 
-The API defaults to 16 KiB per response. For longer logs, use `--offset` with
-the previous response's `next_offset`, or read the complete files directly:
+For recent output on a 0.4 daemon:
+
+```bash
+rmgr logs JOB_ID --tail 4096 --follow --timeout 20 --text
+```
+
+Reads default to 16 KiB per response; follow also has time and byte limits.
+Use `--offset` with `next_offset` to continue, or read the complete files directly.
+
+<details>
+<summary>Read output files directly, including after the daemon stops</summary>
 
 ```bash
 job=JOB_ID
@@ -156,6 +172,22 @@ Set `job` to the printed job ID. Get/save the paths while the daemon is running;
 the files can then be read directly even while it is stopped. For a custom state
 directory, pass `rmgr --home /that/path` to CLI commands. `tail -F` keeps
 waiting after a job finishes; Ctrl-C stops the viewer, not the job.
+
+</details>
+
+<details>
+<summary>Older clients without text views</summary>
+
+```bash
+watch -n 2 'rmgr list'
+rmgr logs JOB_ID --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["text"], end="")'
+```
+
+Add `--stream stderr` for stderr. Upgrading the client provides the text views;
+daemon-dependent features require upgrading and restarting the daemon too.
+
+</details>
+
 Old jobs keep their pre-upgrade central paths. New jobs default to unique
 rmgr-JOB_ID.stdout.log / rmgr-JOB_ID.stderr.log files in job cwd. Explicit paths
 must not already exist. If output files are moved or deleted, logs reports

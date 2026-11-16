@@ -1,5 +1,60 @@
 # Validation and workloads
 
+This is a dated evidence record, not a claim that every current change has been
+tested on every host. Commit references use the documentation-only history
+rewrite; the corresponding tested runtime code is unchanged.
+
+| Date / candidate | Result | Scope |
+| --- | --- | --- |
+| 2026-11-14: original host-setup patch on base `4e08c9c` | 97 tests passed, no skips | Disposable Ubuntu VM; real systemd/cgroups, installation, operator cancellation, logout and reboot checks. |
+| 2026-11-14: audited revision, now `69e412f` | 91 passed, 8 skipped (99 total) | Local suite; deadline regression included. Revised code was not rerun in the VM. |
+| 2026-11-11: 0.3 output separation | 60 passed, no skips | Host systemd, output handling, and persistence; additional focused and installed-wheel checks below. |
+| 2026-11-10: source at `4a9d3de` | 47 passed, no skips | Host enforcement and recovery; FE and GPU checks recorded separately below. |
+
+- [Installation and recovery checks](#installation-and-recovery-checks-on-2026-11-14)
+- [Output separation audit](#output-separation-and-consistency-audit-on-2026-11-11)
+- [Host validation](#host-validation-on-2026-11-10)
+- [Native FE interoperability](#native-fe-interoperability-on-2026-11-10)
+- [Mock workloads](#mock-workload-checks-on-2026-11-10)
+- [Earlier sandbox evidence](#earlier-sandbox-evidence)
+- [Run the host suite](#run-the-host-suite-first)
+- [FE solver integration](#fe-solver-integration)
+- [GPU smoke test](#gpu-smoke-test)
+
+## Installation and recovery checks on 2026-11-14
+
+A disposable Ubuntu 24.04 guest used QEMU TCG software emulation and an official
+cloud image with its signed checksum verified. The initial guest had no Runwarden
+installation or delegation repairs. The candidate was the supplied host-setup
+patch on base `4e08c9c`, before the subsequent audit corrections.
+
+The first installation reproduced two blockers: pipx's executable directory was
+absent from PATH, and the user manager did not delegate `cpuset`. After an explicit
+PATH correction and guest-only delegation change followed by reboot:
+
+- `doctor`, service installation, and `health --wait 30` passed.
+- A submitted job verified its working directory, assigned CPU affinity, and
+  separate stdout/stderr contents.
+- The full suite with `RMGR_SYSTEMD_TESTS=1` passed all 97 tests without skips,
+  including real cgroup memory OOM, walltime, and descendant-cancellation checks.
+- A virtualenv installation passed on the same repaired guest, with the service
+  confirmed to use that environment's interpreter.
+- Ordinary-user `admin-cancel` was denied; guest-root cancellation succeeded and
+  recorded the root peer UID in the job's audit history.
+- With lingering enabled, the service survived logout and started after another
+  reboot. Completed-job history and output remained retrievable.
+
+The audit then corrected the readiness deadline behavior and setup instructions.
+That revision, now `69e412f`, passed 91 local tests with eight host-dependent skips
+(99 total), including deterministic deadline regressions. It was not rerun in
+the VM. The VM evidence therefore does not establish a live test of those final
+corrections. Shell examples and offline command discovery were also checked.
+
+The VM was shut down and its reservation released. Host production software and
+configuration were not changed. This was one guest configuration, not a distro
+matrix, GPU test, or performance benchmark. The virtualenv check reused the
+repaired guest; reboot checks covered completed jobs, not running-job survival.
+
 ## Output separation and consistency audit on 2026-11-11
 
 The 0.3 source changes were checked with the complete 60-test suite using host
@@ -23,7 +78,7 @@ sandbox run passed 53 tests with eight host-only checks skipped.
 
 ## Host validation on 2026-11-10
 
-The source checkout at `72df7dc` passed all 47 tests with no skips using:
+The source checkout corresponding to `4a9d3de` passed all 47 tests with no skips using:
 
 ```bash
 RMGR_SYSTEMD_TESTS=1 python3 -m unittest discover -s tests -v

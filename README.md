@@ -1,88 +1,58 @@
 # Runwarden
 
-Runwarden (`rmgr`) is a small Python queue for cooperating agents on one Linux workstation.
-It reserves physical cores, RAM, and an optional single GPU. Exclusive jobs
-run alone among managed jobs. Systemd owns each job's process tree and enforces
-CPU sets, RAM limits, execution timeouts, and cancellation.
+Runwarden (`rmgr`) queues experiments on a single Linux workstation—for one
+agent submitting many jobs or several agents sharing resources. It reserves
+physical CPU cores, RAM, and optional access to one GPU. Systemd enforces CPU
+assignments, memory limits, execution timeouts, and process-tree cancellation.
+GPU reservations are cooperative.
 
-This is an initial implementation. Scheduler, interface, and live systemd/cgroup
-tests passed on the development host. Validate enforcement on each target host
-before relying on it for experiments. See [validation](docs/validation.md) for
-the exact evidence and remaining workload checks.
+**Requirements:** Linux with cgroup v2 · systemd 254+ · Python 3.11+
 
-## Point an agent at the tool
+**Status:** 0.4 development (`0.4.0.dev1`). No Python runtime dependencies.
+Validate enforcement on each target host; see the [validation evidence](docs/validation.md).
 
-Tell the agent: **"Run `rmgr instructions` and follow the printed instructions
-before submitting experiments."**
+**On this page**
+
+- [Install and verify](#install-and-verify)
+- [Point an agent at Runwarden](#point-an-agent-at-runwarden)
+- [Submit your first job](#submit-your-first-job)
+- [Monitor jobs and read output](#monitor-jobs-and-read-output)
+- [Configure resources](#configure-resources)
+- [Receipts, cancellation, and recovery](#receipts-cancellation-and-recovery)
+- [Troubleshooting and upgrades](#troubleshooting-and-upgrades)
+- [Limits and security](#limits-and-security)
+- [Examples and development](#examples-and-development)
+
+## Install and verify
+
+For an existing installation, follow [upgrade or repair](docs/host-setup.md#upgrade-or-repair).
+For a first installation:
+
+**1. Get the source.** If you already have a checkout, use that directory.
 
 ```bash
-rmgr instructions         # Readable instructions on stdout
-rmgr instructions --json  # The same text with version/topic metadata
+git clone https://github.com/syadegari/runwarden.git
+cd runwarden
 ```
 
-This works offline without a daemon or state directory. The instructions cover
-direct command submission, resource limits, monitoring, private control keys,
-and preserving receipt paths in handoff notes. They are also available through
-`rmgr manual instructions`, so the installed package has one source of truth.
-
-The per-job `control_token` is generated automatically and required by the API
-for ordinary cancellation and submission retries. There is no API to edit a submitted
-job's command or resources. The `--exclusive` flag controls scheduling (running
-alone among managed jobs); it does not grant ownership or replace the key.
-Receipts protect against accidental API interference, not unrestricted access
-by other processes running under the same Linux account.
-
-The bundled manual works offline, includes examples and failure handling, and
-supports topics or `rmgr manual all --json`. Command-specific `--help` supplies
-exact syntax. No plugin, network lookup, or running daemon is needed to read it.
-
-## Host setup
-
-Before installing, check that your user manager delegates CPU and memory controls:
+**2. Check host delegation** from a normal host terminal:
 
 ```bash
 systemctl show "user@$(id -u).service" -p Delegate -p DelegateControllers
 ```
 
-Run this from a normal host terminal. If the user bus is unavailable, first
-check `systemctl --user status`; a restricted sandbox or missing login session
-does not establish a delegation problem. The `cpu` and `cpuset` controllers are
-separate: having `cpu` alone does not allow enforced core assignments.
+If `cpuset` or `memory` is missing, complete the
+[host setup steps](docs/host-setup.md#missing-cpu-or-memory-delegation) before
+continuing. The `cpu` and `cpuset` controllers are separate. If the user bus is
+unavailable, first check `systemctl --user status` outside any restrictive sandbox.
+**Before any repair that requires a reboot, finish/cancel managed jobs and save your work.**
 
-If `cpuset` or `memory` is missing, run `sudo systemctl edit "user@$(id -u).service"`
-and add this above the editor's discard line:
-
-```ini
-[Service]
-Delegate=cpu cpuset memory pids
-```
-
-Before rebooting an existing installation, pause submissions from agents and
-finish or cancel all queued/running jobs. Stop the scheduler with `rmgr service stop`
-after draining the queue; stopping it alone does not stop job units.
-Save your work, then reboot the whole PC with `sudo reboot`. Restarting only
-`rmgr.service` does not apply this change. After login, stop an existing service
-again with `rmgr service stop` before running `doctor`: it may have started at boot.
-The same instructions are available offline after installation: `rmgr manual host-setup`.
-
-## Install
-
-Requires Python 3.11+, Linux with cgroup v2, and systemd 254+ (Ubuntu 24.04
-has systemd 255). There are no Python runtime dependencies. On a fresh Ubuntu
-24.04 system, install the packaging tools with
-`sudo apt-get install pipx python3-venv` if they are missing.
-
-Set up pipx's executable directory before invoking `rmgr`:
+**3. Install and verify enforcement.** On fresh Ubuntu 24.04, install missing
+packaging tools with `sudo apt-get install pipx python3-venv`. Then:
 
 ```bash
 pipx ensurepath &&
-export PATH="${PIPX_BIN_DIR:-$HOME/.local/bin}:$PATH"
-```
-
-`ensurepath` configures future shells; the export also updates this shell.
-For a first installation, run from this checkout:
-
-```bash
+export PATH="${PIPX_BIN_DIR:-$HOME/.local/bin}:$PATH" &&
 pipx install . &&
 rmgr init &&
 rmgr doctor &&
@@ -90,14 +60,13 @@ rmgr service install &&
 rmgr health --wait 30 --json
 ```
 
-For an existing installation, see [upgrade or repair](#upgrade-or-repair) below.
+`ensurepath` configures future shells; the export updates this one. `init` creates
+configuration, while `doctor` tests actual enforcement. **Stop if the probe fails**;
+follow its hint or run `rmgr manual host-setup`. `health --wait 30` waits for startup
+and exits nonzero if readiness is not reached.
 
-`init` only creates configuration; `doctor` verifies actual enforcement. If it
-fails, follow its hint or run `rmgr manual host-setup` before continuing.
-`health --wait 30` waits for startup and prints only the final result; a real
-failure still exits nonzero. Check `rmgr service status` if it times out.
-
-If pipx is unavailable, an isolated virtual environment works too:
+<details>
+<summary>Install with a virtual environment instead</summary>
 
 ```bash
 python3 -m venv .venv && .venv/bin/python -m pip install . &&
@@ -107,65 +76,127 @@ python3 -m venv .venv && .venv/bin/python -m pip install . &&
 .venv/bin/rmgr health --wait 30 --json
 ```
 
-Keep that virtual environment in place: the service records its interpreter's
-absolute path. Neither installation method modifies the `py3.14` environment.
-The manager's Python and a job's Python can be different versions/environments.
+Use `.venv/bin/rmgr` in the commands below, or activate the environment.
+Keep the environment at its original path: the service records its interpreter's
+absolute path. Jobs can use a different Python environment from the manager.
 
-### Upgrade or repair
+</details>
 
-To upgrade to this checkout, pause agent submissions, finish/cancel managed jobs,
-and stop the existing service before replacing package files. Back up the state
-directory and retain private receipts. With the pipx PATH setup above in place:
+Use one shared daemon and state directory for all agents. The default state
+location is `$XDG_STATE_HOME/rmgr`, or `~/.local/state/rmgr`.
+For startup at boot and persistence after logout, see
+[user lingering](docs/host-setup.md#startup-at-boot-and-after-logout).
+
+## Point an agent at Runwarden
+
+Tell the agent:
+
+> Run `rmgr instructions` and follow the printed instructions before submitting experiments.
+
+This works offline. `rmgr manual all` provides the full guide, and
+`rmgr COMMAND --help` shows exact syntax. Agents can also use
+`rmgr describe --json` for a machine-readable command catalog.
+
+## Submit your first job
+
+This example needs only a shell, one configured core, and 64 MiB of available
+reservation capacity. Run it from your experiment directory:
 
 ```bash
-rmgr service stop &&
-pipx install --force . &&
-rmgr init &&
-rmgr doctor &&
-rmgr service install &&
-rmgr health --wait 30 --json
+job=$(rmgr submit --id-only --receipt ./demo.receipt.json \
+  --cores 1 --memory 64M --timeout 30 -- bash -c 'sleep 2 && echo "finished"') &&
+rmgr wait "$job" --timeout 60 &&
+rmgr logs "$job" --text
 ```
 
-For a virtualenv installation, use its `.venv/bin/rmgr` commands and replace
-the pipx command with `.venv/bin/python -m pip install --upgrade .`.
-Keep the environment at its original path. Installing the service after stopping
-it ensures the daemon starts with the updated package.
+Use a new receipt path for each new experiment. Submission returns immediately;
+`wait` waits for completion, and `logs` retrieves output. A successful submission
+does not mean the experiment succeeded.
 
-For host repair with this version already installed, skip only the package
-installation step, then run `init`, `doctor`, `service install`, and
-`health --wait 30 --json` with the service stopped and no managed jobs active.
-An older client must be upgraded to get `manual host-setup` and `health --wait`;
-changing delegation alone does not add those commands.
+Everything before `--` configures Runwarden; everything after it is your program
+and its arguments. Submit existing programs directly:
 
-### State and service
+```bash
+rmgr submit --receipt ./run-01.receipt.json --cores 2 --memory 1G \
+  --timeout 600 -- python benchmark.py --workers 2
+```
 
-`init` writes configuration only if absent. Its default directory is
-`$XDG_STATE_HOME/rmgr`, or `~/.local/state/rmgr`. The directory must be private
-(mode 0700). It contains `config.json`, `jobs.sqlite3`, a private control socket,
-and per-job launch records/diagnostics. New jobs write program stdout/stderr to
-their working directories, not this database or central directory.
-`--home /absolute/path` selects the daemon state directory. Service lifecycle
-commands always manage the single `rmgr.service`; `--home` changes the state
-path embedded by `service render` or `service install`, not which unit is managed.
-Use one shared daemon/state directory for all agents using this machine.
+Replace the example program with yours and set its worker count to match the
+reservation. Add `--exclusive` to run alone among managed jobs. Jobs have no
+interactive stdin; shell operators such as `&&` require an explicit `bash -c`,
+as in the first example. `program | rmgr` is not a submission interface.
 
-`doctor` starts a short, one-core, 64 MiB probe and verifies the actual CPU and
-memory cgroup settings before reporting readiness. It does not repair the host
-or fall back to unenforced execution. Run it before starting the daemon: it
-refuses to probe while the daemon or managed jobs are running, so diagnostics
-cannot interfere with an exclusive experiment. Use `health` during operation.
-See [host setup](docs/host-setup.md) if it fails.
+<details>
+<summary>Worker counts, Conda, and environment variables</summary>
 
-The installer writes only the user service `rmgr.service`, reloads the user
-manager, and enables/starts it. It does not use sudo. Enable user lingering
-separately if the service must start at boot and survive logout.
+`--cores` controls which physical cores a job may use, not how many threads it
+creates. Executable names are resolved on the submitting client's PATH; activate
+the intended environment or supply an absolute executable path.
+
+OpenMP/BLAS thread defaults match the core reservation. Override them with
+`--env OMP_NUM_THREADS=1`, etc., when needed. Jobs receive a small environment,
+not the agent's complete environment. Explicit variables are stored in job history,
+so do not put secrets in them. See [advanced submission](docs/usage.md#submission-and-environments)
+for Conda, JSON specifications, and dependencies.
+
+</details>
+
+## Monitor jobs and read output
+
+| Task | Command |
+| --- | --- |
+| Overview | `rmgr status` |
+| Refresh automatically | `rmgr status --watch 2` |
+| Active and queued jobs | `rmgr list --text --active` |
+| Finished jobs, all pages | `rmgr list --text --finished --all` |
+| Job details and output paths | `rmgr inspect JOB_ID --text` |
+| Execution directory | `rmgr inspect JOB_ID --cwd-only` |
+| Program stdout / stderr | `rmgr logs JOB_ID --text` / `rmgr logs JOB_ID --stream stderr --text` |
+| Follow recent stdout | `rmgr logs JOB_ID --tail 4096 --follow --timeout 20 --text` |
+
+`status` defaults to text. Other data commands default to JSON; use `--json` for
+compact JSON or `--text` for supported human-readable views. Memory figures are
+**reservations, not measured RAM use**. Add `--wide` to text `list` or `status`
+for complete commands, reasons, and execution directories.
+
+Jobs write `rmgr-JOB_ID.stdout.log` and `rmgr-JOB_ID.stderr.log` in their working
+directory (the submission directory unless `--cwd` is set). `rmgr logs` reads
+those files; SQLite stores metadata and paths, not another copy of the output.
+**Existing output files are never overwritten.** Keep files at their recorded
+locations and manage retention yourself.
+
+<details>
+<summary>Output paths, missing files, and launch failures</summary>
+
+Set `--stdout stdout.log --stderr stderr.log` for custom names in a separate run
+directory. Parent directories must exist; existing targets cause launch failure.
+Missing or moved files cannot be retrieved through `logs`. Launcher diagnostics
+are kept separately from program stderr and appear in the job's `reason` or the
+service journal. See [output details](docs/usage.md#output-files-and-manager-records).
+
+</details>
+
+<details>
+<summary>Pagination, snapshots, and log-reading limits</summary>
+
+`list` shows up to 100 rows by default; `--all` fetches remaining pages. Combine
+`--state` filters or use `--active` / `--finished`; `--cwd PATH` filters by execution
+directory. Log reads are bounded: `--tail 4096` means bytes, not lines.
+`--follow` also has time and byte limits. A finished log read does not establish
+job success. See [monitoring details](docs/usage.md#monitoring-and-pagination)
+for snapshots, cursors, and older-daemon behavior.
+
+</details>
 
 ## Configure resources
 
-Finish/cancel managed work, stop the service, edit `config.json`, then start it.
-Queued jobs retain their original resource requests; reducing capacity below
-those requests can leave them waiting indefinitely. This illustrative configuration
-reserves four cores and an 8 GiB memory budget; use values appropriate for your machine:
+`rmgr init` generates CPU IDs and a memory budget. Its defaults select one
+hardware thread per physical core and reserve 75% of physical RAM. Lower the
+budget if other applications need more headroom.
+
+To change capacity, pause submissions, finish/cancel managed work, stop the service,
+edit the state directory's `config.json`, then start the service. Queued requests
+are not resized when capacity changes. This is an illustrative configuration:
 
 ```json
 {
@@ -175,420 +206,69 @@ reserves four cores and an 8 GiB memory budget; use values appropriate for your 
 }
 ```
 
-Use the CPU IDs generated by `init`; CPU numbering is machine-specific. The
-default picks one available hardware thread per physical core, so two jobs
-cannot receive SMT siblings of the same core. Default RAM capacity is 75% of
-physical memory, leaving headroom for other applications. This is a reservation
-budget, not a live free-memory guarantee. Lower it when sharing the desktop.
+Use the CPU IDs generated for your machine. Set `gpu_count` to `1` only when
+GPU 0 is ready, then use `--gpu` on submission to request it.
+GPU reservations coordinate cooperating jobs; they do not enforce
+device isolation or partition GPU memory. `gpu_device_isolation: false` does not
+mean the GPU is inaccessible. See [GPU health fields](docs/usage.md#gpu-health-fields).
 
-Set `gpu_count` to 1 only when GPU 0 is ready. GPU ownership is a cooperative
-reservation; there is no device-access security or GPU memory partitioning.
+## Receipts, cancellation, and recovery
 
-Both `health` and a successful `doctor` report these GPU fields under `enforcement`:
-
-- `gpu_device_isolation: false`: GPU device access is not enforced; this does
-  not mean the GPU is inaccessible. This replaces the misleading
-  `gpu_device_access` field in older versions.
-- `gpu_reservation`: whether GPU scheduling is enabled (`gpu_count=1`).
-- `gpu_availability: "not_checked"`: neither check tests GPU hardware or drivers.
-- `gpu_note`: explains these limitations and whether reservations are enabled.
-
-When upgrading, reinstall the package and restart the daemon to update `health`.
-Older cached enforcement evidence is translated to the new fields on startup.
-
-## Submit and query
-
-Submit the target program directly; no wrapper script or JSON specification is
-required:
+Every job has a public ID and a private control token saved in its receipt.
+All agents can inspect jobs; ordinary cancellation and retries require the token.
+Keep receipts private, outside source control, and in a durable location. Preserve
+receipt paths in agent handoff notes. Existing receipts are never overwritten.
 
 ```bash
-rmgr submit --receipt ./run-01.receipt.json --cores 16 --memory 8G \
-  --timeout 600 -- python -m fe_solver solve /absolute/path/to/run.toml \
-  --solver-backend superlu_mt --num-threads 16
+rmgr lookup --receipt ./run-01.receipt.json --json  # Find without submitting
+rmgr retry --receipt ./run-01.receipt.json         # Recover an uncertain submission
+rmgr cancel JOB_ID --receipt ./run-01.receipt.json
 ```
 
-Run from the FE checkout (or set `--cwd /path/to/fe_solver`) with the intended
-Python environment active and the solver's native library configured as usual.
-`rmgr` resolves `python` on the submitting client's PATH. Each FE run should
-have its own deck/output directory.
-
-Everything before `--` configures the manager; everything after it is the
-program and its arguments. `--cores` reserves capacity; the program's own flags
-control its workers. Submission queues the command and returns a job ID; use
-`wait` for completion and `logs` for output. A pipe such as `program | rmgr`
-would start the program immediately and pipe its output, bypassing admission
-and launch-time resource enforcement. It is not a submission interface.
-Submission does not stream the program's output to your terminal. Use `logs`
-or read the output files below. Jobs have no interactive stdin. Shell syntax
-such as `&&` must be part of an explicitly submitted shell command:
-
-```bash
-rmgr submit --receipt ./sleep-01.receipt.json --cores 16 --memory 64M \
-  -- bash -c 'sleep 10 && echo "finished"'
-```
-
-```bash
-rmgr submit --receipt ./experiment-01.receipt.json --request-id experiment-01 --cores 8 --memory 16G \
-  --timeout 600 -- python benchmark.py --workers 8
-
-rmgr submit --receipt ./timing.receipt.json --cores 8 --memory 16G --exclusive -- python timing_test.py
-
-rmgr list --json
-rmgr inspect JOB_ID --json
-rmgr logs JOB_ID --limit 16384 --offset 0 --json
-rmgr logs JOB_ID --stream stderr --json
-rmgr wait JOB_ID --timeout 30 --json
-rmgr cancel JOB_ID --receipt ./experiment-01.receipt.json
-```
-
-An exclusive job reserves solitude among managed jobs even if it uses only
-eight cores. It does not stop your desktop, other agents, or unmanaged commands.
-An allocation of eight cores limits where a job can run; it does not prevent
-the application from creating more threads. Configure worker counts explicitly.
-
-Executable names are resolved on the submitting client. For Conda, either
-activate the intended environment first or pass its absolute Python path:
-
-```bash
-conda run -n py3.14 python -c 'import sys; print(sys.executable)'
-# Use that executable in the job command.
-```
-
-OpenMP/BLAS thread defaults equal the allocated core count. Override them with
-`--env OMP_NUM_THREADS=1`, etc., when workers each need one thread. Jobs get a
-small environment, not a copy of the agent's environment. Set any required
-library paths or application variables explicitly. Explicit environment values
-are saved in job history, so avoid putting secrets in them.
-
-For structured submission, `rmgr submit --receipt ./job.receipt.json --spec job.json --request-id stable-key`
-accepts fields `argv`, `cwd`, `cores`, `memory_bytes`, `gpu`, `exclusive`,
-`timeout_seconds`, `after_success`, `env`, `stdout`, and `stderr`. In JSON, the executable and cwd
-must be absolute. Unknown fields and impossible requests are rejected.
-With `--spec`, put all job settings in the JSON file; command-line job options
-are rejected if explicitly supplied alongside it. `--receipt` and `--request-id`
-still apply to submission.
-
-The CLI saves a private receipt before sending the request. After a lost
-response, run `rmgr retry --receipt ./job.receipt.json`; the same request ID,
-specification, and control token return the original job. Reusing another
-caller's request ID does not grant control. A deliberate rerun needs a new
-receipt/request ID. Existing receipt files are never overwritten.
-
-## Program output and manager records
-
-Starting with 0.3, each new job writes these files in its `--cwd` (default: the
-directory from which you submit):
-
-```text
-rmgr-JOB_ID.stdout.log
-rmgr-JOB_ID.stderr.log
-```
-
-Use explicit names when each experiment has its own run directory:
-
-```bash
-rmgr submit --receipt ./run-02.receipt.json --cwd /path/to/experiment \
-  --stdout stdout.log --stderr stderr.log --cores 16 --memory 8G \
-  -- /path/to/python -m fe_solver solve run.toml --solver-backend superlu_mt --num-threads 16
-```
-
-Relative output paths are relative to the job's cwd; absolute paths also work.
-Parent directories must already exist. The launcher creates private regular
-files (mode 0600) when the job starts. Existing files, symlinks, and output-path
-collisions cause launch failure rather than overwriting/appending another run.
-A failed launch can leave empty files it created before the failure.
-
-Submission and `inspect` return `stdout_path` and `stderr_path`. `rmgr logs`
-reads those files; it also returns `path` and `available`. Before creation, or
-if a file/directory was removed or moved, it returns `available: false` and empty
-text. Replacing a new job's output file produces `LOG_UNAVAILABLE`, so a different
-file is not silently presented as that job's output. Keep output files at their
-recorded locations if you want to retrieve them through the API.
-
-SQLite stores job metadata and output paths, not program output. The central
-`jobs/JOB_ID/` directory keeps the launch manifest, output-file identity record,
-and any `launch-error.txt`. Launcher errors are exposed in the job's `reason`
-and the journal, not mixed into program stderr. Scheduler messages are in
-`journalctl --user -u rmgr.service`. Retention of both records and output files
-is manual.
-
-On upgrade, existing jobs (including queued jobs) keep their old central output
-paths; `rmgr logs` continues to read them. Existing receipts remain valid. Back
-up the state directory, stop the scheduler, reinstall the package, and restart
-it to enable 0.3 behavior. Do not replace package files while a launcher starts.
-
-## Job control tokens
-
-Submission returns a public `id` and the receipt path. Starting with the 0.4
-client, the private `control_token` stays in the receipt unless `--show-token`
-is explicitly requested on submit/retry. Ordinary cancellation requires that token, supplied through `--receipt PATH` or
-`--token-stdin`. Tokens are never included in public queries or job manifests;
-the daemon stores only their hashes. Read-only queries remain shared.
-
-Keep receipts private and out of source control. They are created with mode
-0600 and are never found/reused automatically on another agent's behalf. The
-receipt is the recovery path after a lost response or conversation restart.
-There is no ordinary-user tokenless force-cancel or lost-key recovery API.
-The 0.4 daemon adds a separate root-authorized `admin-cancel` operation with an
-audit reason; see the operator section below.
-This guards against accidental API interference, not unrestricted same-user
-filesystem access or direct process/service control. See `rmgr manual ownership`.
-
-Version 0.2 adds a token-hash column while preserving old history. Finish/cancel
-0.1 jobs before upgrading: legacy jobs have no token and cannot be cancelled
-through ordinary token-authorized cancellation. They remain readable and are
-not silently claimed; the 0.4 operator path can cancel them explicitly.
-
-## Dependencies
-
-```bash
-a=$(rmgr submit --id-only --receipt ./a.receipt.json --cores 8 -- python A.py)
-rmgr submit --receipt ./b.receipt.json --cores 8 --after-success "$a" -- python B.py
-rmgr submit --receipt ./c.receipt.json --cores 8 --after-success "$a" -- python C.py
-```
-
-B and C become eligible after A succeeds. They may overlap if resources fit;
-their start times are not synchronized. Failed or cancelled prerequisites block
-dependent jobs permanently. Dependencies must name existing jobs, preventing
-cycles. Ready jobs use FIFO admission; a waiting ready job stops later ready
-jobs from passing it. This prevents starvation but can leave resources idle.
-
-## Health and recovery
-
-```bash
-rmgr service status
-rmgr health --json
-rmgr resources --json
-rmgr service restart
-journalctl --user -u rmgr.service -n 100
-```
-
-`service status` reports systemd state. `health` checks the API, database, and
-systemd connection. `doctor` additionally exercises real enforcement. A PID file
-or existing socket is never treated as proof of health.
-
-Jobs run in independent systemd units. Stopping/restarting the scheduler does
-not cancel them. On recovery it reconciles those units with persisted reservations
-before scheduling. Missing units become `interrupted`; uncertain launches are
-never automatically replayed. Backend query failures stop admission and retain
-reservations. Reboot interrupts running jobs, while queued jobs remain durable.
-
-Final states are `succeeded`, `failed`, `cancelled`, `timed_out`, `oom`, `blocked`,
-and `interrupted`. CLI exit codes: 0 success, 2 API/configuration/service error,
-3 wait deadline reached (job still running/queued), 4 job completed unsuccessfully.
-Argparse usage errors also return 2. `inspect` returns 0 for an existing job
-regardless of that job's outcome.
-
-Program-output reads are byte-cursor based and bounded per response. A UTF-8 character split at
-a cursor can be replaced in the displayed text; the stored log bytes remain
-unchanged. Disk log retention is manual in this first version. Input files and
-executables are not snapshotted: preserve an experiment's checkout/deck until it
-finishes. History stores the submitted command and environment, not automatic
-source revision discovery. Existing data commands return indented JSON by default;
-`--json` makes it compact. `instructions`, `manual`, help, `service render`, and
-submission with `--id-only` have plain-text output. Human-readable monitoring
-commands are described below.
-
-## Human-readable monitoring
-
-```bash
-rmgr status                           # Capacity, readiness, and all active/queued jobs
-rmgr status --watch 2                  # Refresh until Ctrl+C
-rmgr list --text --active              # Queued, starting, running, cancelling
-rmgr list --text --finished            # All terminal states, including blocked/interrupted
-rmgr list --text --state running --state queued
-rmgr list --text --finished --all --wide
-rmgr inspect JOB_ID --text             # Details, current capacity, and output paths
-rmgr resources --text
-rmgr health --text
-rmgr logs JOB_ID --text
-rmgr logs JOB_ID --stream stderr --text
-```
-
-`status` defaults to text; `--json` returns an object with `observed_at`, `health`,
-`resources`, and `jobs`. Other commands keep their existing JSON defaults and
-accept `--text` explicitly. `--json` and `--text` cannot be combined.
-These views need no external formatting tools and work with a 0.2 daemon.
-They query only public job information; they do not read receipts or control tokens.
-
-Memory figures are **reservations, not measured RAM usage**. Tables show full
-job IDs, requested CPUs/memory, execution runtime, exit code, command, and reason.
-Jobs that never started have no runtime; finished runtimes stop at the end time.
-Use `--wide` on text `list` or `status` to show complete command lines, reasons,
-and execution directories. `inspect JOB_ID --cwd-only` prints the directory alone;
-JSON inspect/list already include it as `spec.cwd`. `list --cwd PATH` selects
-jobs from that exact directory. This is the configured execution directory, not
-a separately recorded shell invocation directory or the process's current cwd.
-`inspect --text` shows the full command and recorded reason; it does not interpret
-application stderr. Its available resources are current, not historical.
-
-`list` defaults to 100 rows, oldest first; the footer reports additional pages.
-`--all` fetches every remaining match from `--offset`. `--limit` remains a page
-size of 1–100. Repeated `--state` values are combined before applying the offset
-and limit. Choose only one of `--state`, `--active`, or `--finished`.
-`status` includes every active/queued job, across pages.
-With a 0.4 daemon, status is a consistent snapshot and list pages use an immutable
-snapshot. Continue a page with `--snapshot ID --offset NEXT_OFFSET`, or let
-`--all` do it. Snapshots expire after 120 seconds, on daemon restart, or when
-evicted from the bounded cache (16 snapshots / 32 MiB total). Expired snapshots
-return `SNAPSHOT_EXPIRED`; start a new listing explicitly. Narrow the state/cwd
-filters if one snapshot exceeds 32 MiB. Legacy daemons use separate live queries
-and report `consistency: best_effort_legacy`; jobs may change between pages.
-
-`--watch` takes a positive finite interval in seconds, measured between completed
-refreshes. Text watch redraws a terminal, or appends snapshots when redirected;
-`--json --watch 2` emits one JSON object per line. Ctrl+C exits with code 130.
-Degraded health is displayed and retried during watch; connection errors stop
-monitoring with exit code 2. A one-shot degraded `status` also returns 2.
-
-`logs --text` writes the selected chunk directly to stdout without adding a
-newline. Offset/limit remain byte-based. More-output and missing-file notices
-go to stderr, as do CLI/API errors (still JSON). Use `--tail 4096` to start at
-the last 4096 **bytes** (requires a 0.4 daemon). `--follow` polls until a terminal
-job's remaining output is read, a deadline expires, or its byte budget is reached.
-Defaults are `--timeout 30 --interval 1 --max-bytes 1048576`. Follow output is
-raw text with `--text`, otherwise one JSON chunk per line. Completion of a log
-read is not evidence of job success; use `wait` or `inspect` for that.
-
-### Try the development client without installing it
-
-From this checkout, use its Python module instead of the installed executable:
-
-```bash
-cd /path/to/runwarden
-python3 -m rmgr.cli status
-python3 -m rmgr.cli status --watch 2
-python3 -m rmgr.cli list --text --finished --all
-python3 -m rmgr.cli inspect JOB_ID --text
-```
-
-Use Python 3.11 or newer. These commands read the existing daemon and do not
-install the package, restart the service, or submit/cancel jobs. For a nondefault
-state directory, put `--home PATH` before the command. Tests requiring no live
-daemon are available with `python3 -m unittest tests.test_views -v`.
-
-To use the development client from any worktree **without changing its cwd**:
-
-```bash
-rmgr-dev() { /path/to/runwarden/scripts/rmgr-dev "$@"; }
-rmgr-dev describe submit --json
-rmgr-dev list --text --active --wide
-rmgr-dev inspect JOB_ID --cwd-only
-```
-
-This replaces the earlier convenience function that changed into the repository.
-The launcher preserves the caller's cwd, so default execution/output directories
-remain in the worktree where you invoke it. It does not install anything or start
-a daemon. Like the installed CLI, actual submit/cancel commands still change jobs;
-use only read commands against production while evaluating the new version.
-
-For new daemon-side features without upgrading production, start the **synthetic,
-read-only preview** from the checkout in one terminal:
-
-```bash
-python3 -m rmgr.preview
-```
-
-It prints commands containing its temporary `--home`. Run those in another
-terminal from this checkout. You can also use that home for `validate`,
-`list --all --text --wide`, and `inspect`. The preview has three synthetic jobs,
-sample output files, and private sample receipts. It never calls systemd or
-executes workloads, rejects submissions/cancellations, and removes temporary
-state on Ctrl+C. Do not use its resource numbers as host measurements.
-
-## Agent discovery and recovery (0.4 development)
-
-```bash
-rmgr describe --json                   # Offline command catalog and contracts
-rmgr describe submit --json            # One command, including its arguments
-rmgr health --json                     # Actual daemon protocol_version/features
-rmgr validate --cores 8 --memory 16G -- /path/to/python -m fe_solver solve ...
-rmgr lookup --receipt ./run.receipt.json --json
-rmgr logs JOB_ID --stream stderr --tail 4096 --follow --timeout 20 --text
-```
-
-`describe` is generated from CLI argument definitions and JobSpec fields. It
-reports authorization, output-field names, defaults, limits, states, and exit
-codes. `instructions` remains the concise agent entry point. Client version is
-not a guarantee of daemon features: inspect health's `protocol_version` and
-`features`; their absence means legacy/unknown. Validation, tail, snapshots,
-structured queue details, and operator cancellation require the new daemon.
-
-`validate` checks the resolved specification, executable, dependencies, and output
-paths against current configured capacity. It reports the effective environment
-and warnings but writes no receipt, reserves nothing, and cannot guarantee
-future launch. `lookup` reads only the explicitly supplied receipt and finds its
-request ID without submitting or exposing its token; `found: false` means no
-accepted job was found. It also works with older daemons by searching public history.
-
-Submission errors now include `acceptance`, `recovery`, `request_id`, and `receipt`
-when a receipt has been saved and submission attempted. A definite rejection
-instructs the caller to correct the request and use a new receipt. An uncertain
-outcome requires retrying the same receipt; never create a second job to recover
-an uncertain submission. Local errors before submission may lack these fields.
-Existing accepted retries still return the original job, even if it failed.
-
-Queued jobs expose `reason_details` with a stable code and relevant blocking IDs
-or requested/available resource amounts. Codes include `CPU_RESERVATION`,
-`MEMORY_RESERVATION`, `GPU_RESERVATION`, `EXCLUSIVE_RUNNING`, `EXCLUSIVE_DRAIN`,
-`DEPENDENCIES`, `DEPENDENCY_FAILED`, and `FIFO_BARRIER`. Older jobs may have null
-details until their next scheduling decision. Existing JSON fields remain;
-new metadata is additive, except that printing a control token is now opt-in.
-
-## Operator cancellation without a job key
-
-After a planned upgrade to the new daemon, an operator can run:
-
-```bash
-sudo /absolute/path/to/rmgr --home /absolute/path/to/user-state/rmgr \
-  admin-cancel JOB_ID --reason 'Stopped by the operator'
-```
-
-Use the executable from a trusted installation and the explicit target state
-directory. This is a privileged operator command, not an agent workaround for
-a denied cancellation. The daemon verifies UID 0 from Unix-socket peer credentials;
-request JSON and environment variables cannot grant that authority. Nothing is
-added to sudoers, and no automatic sudo invocation is performed.
-
-The daemon commits an audit entry and cancellation intent before stopping the
-unit. Queued jobs are cancelled immediately; running jobs enter `cancelling`
-and retain reservations until their processes stop. It uses the same systemd
-process-tree termination path as normal cancellation. Completed jobs keep their
-outcome. `inspect` exposes `operator_actions` with time, peer UID, reason, and
-previous state. It can also cancel legacy jobs that have no token. A daemon
-connection is required; it does not edit SQLite or kill processes behind a stopped
-daemon. The receipt rules for ordinary agents remain unchanged.
-
-This development checkout has not been installed into the shared service.
-Test the operator path without sudo or real jobs using
-`python3 -m unittest tests.test_agent_tools -v`. Peer authorization and backend
-stop requests are simulated there; actual privileged termination is not claimed
-as host-validated by those tests.
-
-## Development and boundaries
-
-See [demo jobs](docs/demo-jobs.md) for two CUDA simulations, two 16-thread native
-FE benchmarks, submission commands, monitoring, and persistent logs.
-The [code/documentation audit](docs/code-documentation-audit.md) records the
-0.3 consistency review, fixes, and validation boundaries.
-
-```bash
-python3 -m unittest discover -s tests -v
-RMGR_SYSTEMD_TESTS=1 python3 -m unittest tests.test_systemd_integration -v
-```
-
-The opt-in suite uses short jobs, no more than two physical cores, and at most
-512 MiB in total. It does not install services or change host configuration.
-FE and GPU workload examples are described in [validation](docs/validation.md).
-
-The source separates request validation, persistence, scheduling, systemd
-execution, transport, and CLI concerns. It uses standard-library `unittest` and
-test doubles for scheduler failures, plus real opt-in cgroup tests. There is no
-network server, cluster scheduler, automatic retry policy, or container backend.
-
-This is a cooperating-user resource manager, not a security sandbox. A client
-that can submit jobs can execute code as the daemon's user outside the client's
-sandbox. Jobs could deliberately move themselves out of user-owned cgroups.
-Docker/MPI remote launches and other external daemons do not automatically
-inherit these limits. Only native local workloads that stay in their job cgroup
-are supported. See [development permissions](docs/development-permissions.md).
+After a lost submission response, retry the **same receipt** to avoid duplicates.
+An accepted retry returns the original job, even if that job failed. A deliberate
+rerun needs a new receipt/request ID. There is no API to edit a submitted job.
+
+Keys prevent accidental API interference, not unrestricted access by processes
+sharing a Linux account. A human operator has a separate root-authorized
+[admin-cancel command](docs/host-setup.md#operator-cancellation-without-a-job-key).
+For detailed contracts, see `rmgr manual ownership` and
+[agent discovery and recovery](docs/usage.md#agent-discovery-and-recovery).
+
+## Troubleshooting and upgrades
+
+| Check | Command / action |
+| --- | --- |
+| Daemon readiness | `rmgr health --json` |
+| Service state | `rmgr service status` |
+| Why a job is waiting or failed | `rmgr inspect JOB_ID --text` |
+| Scheduler diagnostics | `journalctl --user -u rmgr.service -n 100 --no-pager` |
+| Enforcement before startup | `rmgr doctor` — only with the daemon and jobs stopped |
+
+Follow the [host setup guide](docs/host-setup.md) for delegation failures, PATH,
+service persistence, upgrades, and older-version compatibility. Do not replace
+package files while job launchers are starting.
+
+Jobs run in independent systemd units: restarting the scheduler does not cancel
+them. Reboot interrupts running jobs; queued jobs remain durable. Uncertain launches
+are never automatically replayed. See [recovery and exit codes](docs/usage.md#recovery-states-and-exit-codes).
+
+## Limits and security
+
+- One shared daemon on one Linux workstation; no cluster scheduler or network server.
+- Native local workloads must stay in their job cgroup. Remote MPI ranks and jobs
+  launched through external daemons do not automatically inherit these limits.
+- `--exclusive` applies only to managed jobs; it does not stop desktop applications.
+- Runwarden is not a security sandbox. Submission permits execution as the daemon's
+  user, and unrestricted same-user programs can bypass its cooperative controls.
+- Inputs and executables are not snapshotted. Preserve each experiment's checkout
+  and inputs until completion; source revisions are not discovered automatically.
+
+## Examples and development
+
+- [Demo jobs](docs/demo-jobs.md): CPU/GPU simulations and native FE benchmarks.
+- [Advanced usage](docs/usage.md): submission, dependencies, monitoring, and API contracts.
+- [Development guide](docs/development.md): source client, isolated preview, and tests.
+- [Validation evidence](docs/validation.md): dated checks and their limitations.
+- [Development permissions](docs/development-permissions.md): agent and host-access boundaries.
+- [Historical code/documentation audit](docs/code-documentation-audit.md): the 0.3 review.
